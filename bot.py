@@ -1,53 +1,59 @@
 import os
-import sys
 import uuid
-import subprocess
-
-# --- AUTO INSTALL PACKAGES (NO requirements.txt NEEDED) ---
-packages = ["python-telegram-bot==20.8", "internetarchive", "requests"]
-for pkg in packages:
-    name = pkg.split("==")[0]
-    try:
-        __import__(name)
-    except ImportError:
-        print(f"Installing {pkg}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-# --- IMPORTS ---
 import requests
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+import telebot
 import internetarchive as ia
 
-# --- YOUR KEYS HARDCODED ---
 TELEGRAM_TOKEN = "8644006980:AAEKBACweZ9kg4M482anjYUkEP5O7DZF7wQ"
 IA_ACCESS = "SjzCWtMdMVYsRBXl"
 IA_SECRET = "THTnm9iXNVafYy9b"
 
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Bot is ready! Send me a direct video link or forward a video to upload directly to Internet Archive."
+
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    bot.reply_to(
+        message,
+        "👋 Bot is ready! Send me a direct video link or forward a video to upload directly to Internet Archive.",
     )
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("📥 Downloading video from Telegram...")
-    video = update.message.video or update.message.document
-    tg_file = await video.get_file()
-
-    item_id = f"tg_video_{uuid.uuid4().hex[:8]}"
-    file_path = f"/tmp/{item_id}.mp4"
-
+@bot.message_handler(content_types=["video", "document"])
+def handle_video_file(message):
     try:
-        await tg_file.download_to_drive(file_path)
-        await status.edit_text("🚀 Uploading to Internet Archive...")
+        status = bot.reply_to(
+            message, "📥 Downloading video from Telegram..."
+        )
+
+        file_id = None
+        if message.video:
+            file_id = message.video.file_id
+        elif message.document:
+            file_id = message.document.file_id
+
+        if not file_id:
+            bot.edit_message_text(
+                "❌ No valid video found.",
+                chat_id=message.chat.id,
+                message_id=status.message_id,
+            )
+            return
+
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        item_id = f"tg_video_{uuid.uuid4().hex[:8]}"
+        file_path = f"/tmp/{item_id}.mp4"
+
+        with open(file_path, "wb") as new_file:
+            new_file.write(downloaded_file)
+
+        bot.edit_message_text(
+            "🚀 Uploading to Internet Archive...",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+        )
 
         item = ia.get_item(item_id)
         item.upload(
@@ -56,31 +62,44 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             access_key=IA_ACCESS,
             secret_key=IA_SECRET,
         )
-        await status.edit_text(f"✅ Upload Complete!\nhttps://archive.org/details/{item_id}")
-    except Exception as e:
-        await status.edit_text(f"❌ Error: {str(e)}")
-    finally:
+
         if os.path.exists(file_path):
             os.remove(file_path)
 
+        bot.edit_message_text(
+            f"✅ Upload Complete!\nhttps://archive.org/details/{item_id}",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+        )
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+
+
+@bot.message_handler(func=lambda msg: True)
+def handle_link_url(message):
+    url = message.text.strip()
     if not url.startswith("http"):
         return
 
-    status = await update.message.reply_text("📥 Downloading video from link...")
-    item_id = f"url_video_{uuid.uuid4().hex[:8]}"
-    file_path = f"/tmp/{item_id}.mp4"
-
     try:
+        status = bot.reply_to(
+            message, "📥 Downloading video from link..."
+        )
+        item_id = f"url_video_{uuid.uuid4().hex[:8]}"
+        file_path = f"/tmp/{item_id}.mp4"
+
         with requests.get(url, stream=True) as r:
             r.raise_for_status()
             with open(file_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
 
-        await status.edit_text("🚀 Uploading to Internet Archive...")
+        bot.edit_message_text(
+            "🚀 Uploading to Internet Archive...",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+        )
 
         item = ia.get_item(item_id)
         item.upload(
@@ -89,18 +108,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             access_key=IA_ACCESS,
             secret_key=IA_SECRET,
         )
-        await status.edit_text(f"✅ Upload Complete!\nhttps://archive.org/details/{item_id}")
-    except Exception as e:
-        await status.edit_text(f"❌ Error: {str(e)}")
-    finally:
+
         if os.path.exists(file_path):
             os.remove(file_path)
 
+        bot.edit_message_text(
+            f"✅ Upload Complete!\nhttps://archive.org/details/{item_id}",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+        )
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+
 
 if __name__ == "__main__":
-    print("Bot is starting...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.run_polling()
+    print("Bot is starting cleanly...")
+    bot.infinity_polling()
