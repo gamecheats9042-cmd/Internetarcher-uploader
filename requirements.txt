@@ -1,4 +1,4 @@
-pyTelegramBotAPI
+telethon
 internetarchive
 requests
-yt-dlp
+cryptg
