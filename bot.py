@@ -3,9 +3,11 @@ import gc
 import uuid
 import time
 import email
+import subprocess
 import urllib.parse
 import asyncio
 import threading
+import imageio_ffmpeg
 import internetarchive as ia
 from telethon import TelegramClient, events
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -20,9 +22,11 @@ BOT_TOKEN = "8644006980:AAEKBACweZ9kg4M482anjYUkEP5O7DZF7wQ"
 IA_ACCESS = "SjzCWtMdMVYsRBXl"
 IA_SECRET = "THTnm9iXNVafYy9b"
 
-# Global stores
 logs_history = []
 uploaded_files_db = []
+
+# Get the exact standalone ffmpeg executable path
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 def add_log(msg):
     timestamp = time.strftime("%H:%M:%S")
@@ -33,7 +37,7 @@ def add_log(msg):
         logs_history.pop(0)
 
 # ==============================================================================
-# FORMATTING UTILITIES
+# FORMATTING & VIDEO REMUX ENGINE
 # ==============================================================================
 def format_size(bytes_size):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -56,6 +60,45 @@ def format_eta(seconds):
     else:
         return f"{secs}s"
 
+def convert_mkv_to_mp4(input_path):
+    """Converts/remuxes any MKV/video into standard fast-start web playable MP4"""
+    base, _ = os.path.splitext(input_path)
+    output_path = f"{base}_streamable.mp4"
+
+    add_log(f"Remuxing video to web MP4 using FFmpeg: {input_path}")
+    
+    # 1. Fast stream copy with faststart (Instant remuxing for H.264/AAC)
+    cmd = [
+        FFMPEG_BIN, "-y", "-i", input_path,
+        "-c:v", "copy", "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            add_log("Fast remuxing to MP4 successful.")
+            return output_path
+    except Exception as e:
+        add_log(f"Remux fast copy failed: {str(e)}")
+
+    # 2. Fallback: Convert audio to AAC if MKV audio format is incompatible
+    cmd_fallback = [
+        FFMPEG_BIN, "-y", "-i", input_path,
+        "-c:v", "copy", "-c:a", "aac",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    try:
+        res = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            add_log("Audio-transcoded remux to MP4 successful.")
+            return output_path
+    except Exception as e:
+        add_log(f"Remux fallback failed: {str(e)}")
+
+    return input_path
+
 # ==============================================================================
 # WEB SERVER & MANAGEMENT DASHBOARD
 # ==============================================================================
@@ -74,7 +117,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <tr>
                 <td><b>{f['title']}</b></td>
                 <td>{f['size']}</td>
-                <td><a href="{f['url']}" target="_blank" class="link-btn">View on Archive</a></td>
+                <td><a href="{f['url']}" target="_blank" class="link-btn">▶️ Play Online</a></td>
                 <td>
                     <form method="POST" action="/rename" style="display:inline-flex; gap: 5px;">
                         <input type="hidden" name="item_id" value="{f['id']}">
@@ -112,7 +155,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">🚀 Internet Archive Hub</h2>
+            <h2 style="margin:0;">🚀 Internet Archive Hub (MKV -> MP4 Playable)</h2>
             <button class="btn" onclick="location.reload()">Refresh</button>
         </div>
 
@@ -182,29 +225,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if uploaded_file_data:
                     item_id = f"web_{uuid.uuid4().hex[:8]}"
                     file_ext = os.path.splitext(file_name)[1] if file_name else ".mp4"
-                    file_path = f"/tmp/{item_id}{file_ext}"
-                    title = custom_title if custom_title else (file_name if file_name else f"Web Upload {item_id}")
+                    raw_path = f"/tmp/{item_id}{file_ext}"
+                    clean_title = custom_title if custom_title else (os.path.splitext(file_name)[0] if file_name else f"Web Upload {item_id}")
 
-                    with open(file_path, "wb") as f:
+                    with open(raw_path, "wb") as f:
                         f.write(uploaded_file_data)
 
-                    file_size_fmt = format_size(len(uploaded_file_data))
-                    add_log(f"Web Direct Upload: {title} ({file_size_fmt})")
+                    final_path = convert_mkv_to_mp4(raw_path)
+                    file_size_fmt = format_size(os.path.getsize(final_path))
+                    add_log(f"Web Direct Upload processing: {clean_title} ({file_size_fmt})")
 
                     item = ia.get_item(item_id)
                     item.upload(
-                        file_path,
-                        metadata={"title": title, "mediatype": "movies", "collection": "opensource_movies"},
+                        final_path,
+                        metadata={
+                            "title": clean_title,
+                            "mediatype": "movies",
+                            "collection": "opensource_movies"
+                        },
                         access_key=IA_ACCESS,
                         secret_key=IA_SECRET
                     )
 
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
+                    for p in [raw_path, final_path]:
+                        if os.path.exists(p):
+                            os.remove(p)
 
                     archive_url = f"https://archive.org/details/{item_id}"
-                    uploaded_files_db.append({"id": item_id, "title": title, "size": file_size_fmt, "url": archive_url})
-                    add_log(f"Web Upload Success: {archive_url}")
+                    uploaded_files_db.append({"id": item_id, "title": clean_title, "size": file_size_fmt, "url": archive_url})
+                    add_log(f"Web Upload Complete: {archive_url}")
 
             self.send_response(303)
             self.send_header("Location", "/")
@@ -284,8 +333,9 @@ async def start_handler(event):
     add_log(f"Chat {event.chat_id} issued /start")
     await event.reply(
         "👋 **Telegram Video & Movie Uploader Ready!**\n\n"
-        "Forward any video or `.mkv` file (up to 2GB) into this chat.\n"
-        "Accurate live speed, ETA (hrs/mins/secs), and progress will be shown."
+        "Forward any `.mkv` or `.mp4` video (up to 2GB) into this chat.\n"
+        "• Automatically converts MKV to web-streamable MP4\n"
+        "• Displays live ETA (hrs/mins/secs) and progress bar"
     )
 
 @bot.on(events.NewMessage)
@@ -302,7 +352,7 @@ async def media_handler(event):
                     break
         
         if not file_name:
-            file_name = f"video_{uuid.uuid4().hex[:6]}.mp4"
+            file_name = f"video_{uuid.uuid4().hex[:6]}.mkv"
 
         file_size = event.message.file.size if event.message.file else 0
 
@@ -311,38 +361,47 @@ async def media_handler(event):
             await event.reply(
                 f"⚠️ **File is too large ({format_size(file_size)})!**\n\n"
                 f"Telegram server restrictions disconnect bot tokens at **2.00 GB**.\n"
-                f"Please upload a 720p or 1080p version under 2.00 GB."
+                f"Please upload a 720p/1080p file under 2.00 GB."
             )
             return
 
         add_log(f"Starting download: '{file_name}' ({format_size(file_size)})")
         status_msg = await event.reply("⏳ **Starting direct MTProto download...**")
         item_id = f"tg_{uuid.uuid4().hex[:8]}"
-        file_path = f"/tmp/{item_id}_{file_name}"
+        raw_path = f"/tmp/{item_id}_{file_name}"
 
         try:
             start_time = time.time()
             last_update = [start_time]
 
+            # Download media from Telegram
             await bot.download_media(
                 event.message.media,
-                file=file_path,
+                file=raw_path,
                 progress_callback=lambda c, t: update_progress(
                     c, t, status_msg, "Downloading File", start_time, last_update
                 )
             )
 
-            add_log(f"Download complete: {file_path}. Uploading to Archive.org...")
+            await status_msg.edit("⚙️ **Converting MKV to streamable MP4 for browser playback...**")
+            
+            # Execute conversion
+            loop = asyncio.get_running_loop()
+            final_path = await loop.run_in_executor(None, lambda: convert_mkv_to_mp4(raw_path))
+
+            add_log(f"Uploading {final_path} to Archive.org...")
             await status_msg.edit("🚀 **Uploading to Internet Archive... Please wait.**")
 
-            loop = asyncio.get_running_loop()
+            clean_title = os.path.splitext(file_name)[0]
             item = ia.get_item(item_id)
+            
+            # Upload streamable MP4 with movies mediatype
             await loop.run_in_executor(
                 None,
                 lambda: item.upload(
-                    file_path,
+                    final_path,
                     metadata={
-                        "title": file_name,
+                        "title": clean_title,
                         "mediatype": "movies",
                         "collection": "opensource_movies"
                     },
@@ -352,19 +411,20 @@ async def media_handler(event):
             )
 
             archive_url = f"https://archive.org/details/{item_id}"
+            final_size_fmt = format_size(os.path.getsize(final_path))
             uploaded_files_db.append({
                 "id": item_id,
-                "title": file_name,
-                "size": format_size(file_size),
+                "title": clean_title,
+                "size": final_size_fmt,
                 "url": archive_url
             })
 
             add_log(f"Upload complete: {archive_url}")
             await status_msg.edit(
                 f"✅ **Upload Complete!**\n\n"
-                f"🎬 **File Name:** `{file_name}`\n"
-                f"📦 **Size:** `{format_size(file_size)}`\n"
-                f"🔗 **Archive Link:** {archive_url}",
+                f"🎬 **File Name:** `{clean_title}.mp4`\n"
+                f"📦 **Size:** `{final_size_fmt}`\n"
+                f"▶️ **Play Online:** {archive_url}",
                 link_preview=True
             )
 
@@ -372,8 +432,9 @@ async def media_handler(event):
             add_log(f"Error handling media: {str(e)}")
             await status_msg.edit(f"❌ **Error:** `{str(e)}`")
         finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            for p in [raw_path, raw_path.replace(os.path.splitext(raw_path)[1], "_streamable.mp4")]:
+                if os.path.exists(p):
+                    os.remove(p)
             gc.collect()
 
 # ==============================================================================
@@ -383,5 +444,6 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Telegram Media Uploader online with Direct Web Upload & File Manager.")
+    add_log(f"Telegram Media Uploader online with FFmpeg at {FFMPEG_BIN}")
     bot.run_until_disconnected()
+        
