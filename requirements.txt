@@ -1,5 +1,4 @@
-telethon
+pyTelegramBotAPI
 internetarchive
 requests
 yt-dlp
-cryptg
