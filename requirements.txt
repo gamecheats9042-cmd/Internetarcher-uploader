@@ -1,4 +1,3 @@
-telethon
+pyTelegramBotAPI
 internetarchive
 requests
-aiohttp
