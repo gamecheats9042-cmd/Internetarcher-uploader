@@ -2,7 +2,7 @@ import os
 import gc
 import uuid
 import time
-import cgi
+import email
 import urllib.parse
 import asyncio
 import threading
@@ -159,18 +159,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/upload":
-            ctype, pdict = cgi.parse_header(self.headers.get("content-type"))
-            if ctype == "multipart/form-data":
-                pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
-                fields = cgi.parse_multipart(self.rfile, pdict)
+            content_type = self.headers.get("Content-Type", "")
+            content_length = int(self.headers.get("Content-Length", 0))
+            
+            if "multipart/form-data" in content_type and content_length > 0:
+                body = self.rfile.read(content_length)
+                msg_headers = f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+                msg = email.message_from_bytes(msg_headers + body)
                 
-                uploaded_file_data = fields.get("file")[0] if "file" in fields else None
-                custom_title = fields.get("custom_title", [""])[0].decode("utf-8") if "custom_title" in fields else ""
+                uploaded_file_data = None
+                custom_title = ""
+                file_name = None
+
+                for part in msg.walk():
+                    disp = part.get("Content-Disposition", "")
+                    if "name=\"file\"" in disp:
+                        uploaded_file_data = part.get_payload(decode=True)
+                        file_name = part.get_filename()
+                    elif "name=\"custom_title\"" in disp:
+                        custom_title = part.get_payload(decode=True).decode("utf-8", errors="ignore").strip()
 
                 if uploaded_file_data:
                     item_id = f"web_{uuid.uuid4().hex[:8]}"
-                    file_path = f"/tmp/{item_id}.mp4"
-                    title = custom_title if custom_title else f"Web Upload {item_id}"
+                    file_ext = os.path.splitext(file_name)[1] if file_name else ".mp4"
+                    file_path = f"/tmp/{item_id}{file_ext}"
+                    title = custom_title if custom_title else (file_name if file_name else f"Web Upload {item_id}")
 
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file_data)
