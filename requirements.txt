@@ -2,3 +2,4 @@ telethon
 internetarchive
 requests
 cryptg
+imageio-ffmpeg
