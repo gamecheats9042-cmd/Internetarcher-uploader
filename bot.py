@@ -3,8 +3,10 @@ import re
 import time
 import uuid
 import threading
+import glob
 import requests
 import telebot
+import yt_dlp
 import internetarchive as ia
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -18,33 +20,27 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 # --- LIVE WEB LOG CONSOLE ---
 logs_history = []
 
-
 def add_log(msg):
-  timestamp = time.strftime("%H:%M:%S")
-  entry = f"[{timestamp}] {msg}"
-  print(entry)
-  logs_history.append(entry)
-  if len(logs_history) > 60:
-    logs_history.pop(0)
-
+    timestamp = time.strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {msg}"
+    print(entry)
+    logs_history.append(entry)
+    if len(logs_history) > 60:
+        logs_history.pop(0)
 
 class DashboardHandler(BaseHTTPRequestHandler):
-
-  def do_GET(self):
-    self.send_response(200)
-    self.send_header("Content-type", "text/html; charset=utf-8")
-    self.end_headers()
-
-    log_rows = "".join([
-        f"<div class='log-row'>{log}</div>"
-        for log in reversed(logs_history)
-    ]) or "<div class='log-row'>No activity recorded yet...</div>"
-
-    html = f"""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        
+        log_rows = "".join([f"<div class='log-row'>{log}</div>" for log in reversed(logs_history)]) or "<div class='log-row'>No activity recorded yet...</div>"
+        
+        html = f"""
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Archive Uploader Console</title>
+            <title>Universal Archive Uploader</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <meta http-equiv="refresh" content="3">
             <style>
@@ -60,7 +56,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <body>
             <div class="container">
                 <div class="header">
-                    <h2>🤖 Archive Direct Uploader</h2>
+                    <h2>🚀 Universal Archive Uploader</h2>
                     <span class="badge">● ONLINE (Auto-refresh 3s)</span>
                 </div>
                 <div class="box">
@@ -71,240 +67,170 @@ class DashboardHandler(BaseHTTPRequestHandler):
         </body>
         </html>
         """
-    self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(html.encode("utf-8"))
 
-  def log_message(self, format, *args):
-    return
-
+    def log_message(self, format, *args):
+        return
 
 def run_web():
-  port = int(os.environ.get("PORT", 8080))
-  server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-  server.serve_forever()
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    server.serve_forever()
 
-
-# --- HELPER FUNCTIONS ---
 def format_size(bytes_size):
-  for unit in ["B", "KB", "MB", "GB"]:
-    if bytes_size < 1024:
-      return f"{bytes_size:.2f} {unit}"
-    bytes_size /= 1024
-  return f"{bytes_size:.2f} TB"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_size < 1024:
+            return f"{bytes_size:.2f} {unit}"
+        bytes_size /= 1024
+    return f"{bytes_size:.2f} TB"
 
-
-# --- TELEGRAM HANDLERS ---
+# --- COMMANDS ---
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-  add_log(f"Chat {message.chat.id} sent /start")
-  bot.reply_to(
-      message,
-      "👋 **Direct Internet Archive Uploader**\n\n"
-      "Send any direct video/file download link (HTTP/HTTPS) to stream and"
-      " upload it to the Internet Archive with no file size limits.\n\n"
-      "💡 *Tip: For Telegram files over 20MB, generate a direct link using a"
-      " file-to-link bot and paste it here!*",
-      parse_mode="Markdown",
-  )
-
-
-@bot.message_handler(content_types=["video", "document"])
-def handle_telegram_media(message):
-  media = message.video or message.document
-  if media and media.file_size and media.file_size > 20 * 1024 * 1024:
-    add_log(
-        f"Rejected direct Telegram file: {media.file_size} bytes exceeds 20MB"
-        " Telegram limit"
-    )
+    add_log(f"Chat {message.chat.id} sent /start")
     bot.reply_to(
         message,
-        f"⚠️ **File is too large ({format_size(media.file_size)}) for direct"
-        " Telegram forwarding!**\n\n"
-        "To upload files without any limit:\n"
-        "1. Forward this file to a link bot (like `@FileStreamBot` or"
-        " `@DirectLinkGeneratorBot`)\n"
-        "2. Copy the generated direct link\n"
-        "3. Paste the link here, and it will upload immediately!",
-        parse_mode="Markdown",
-    )
-    return
-
-  # For files under 20MB
-  status = bot.reply_to(message, "📥 Downloading file from Telegram...")
-  try:
-    file_info = bot.get_file(media.file_id)
-    downloaded = bot.download_file(file_info.file_path)
-
-    item_id = f"tg_upload_{uuid.uuid4().hex[:8]}"
-    file_path = f"/tmp/{item_id}.mp4"
-
-    with open(file_path, "wb") as f:
-      f.write(downloaded)
-
-    bot.edit_message_text(
-        "🚀 Uploading to Internet Archive...",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
+        "👋 **Universal Archive Uploader Bot**\n\n"
+        "⚡ **Supported Inputs:**\n"
+        "• YouTube, Instagram, Facebook, TikTok links\n"
+        "• Direct Video/File Stream URLs\n"
+        "• Direct Bot Download Links\n\n"
+        "Simply send any URL, and the bot will automatically process, extract, and upload it to Internet Archive.",
+        parse_mode="Markdown"
     )
 
-    item = ia.get_item(item_id)
-    item.upload(
-        file_path,
-        metadata={"title": f"Upload {item_id}", "mediatype": "movies"},
-        access_key=IA_ACCESS,
-        secret_key=IA_SECRET,
-    )
-
-    archive_url = f"https://archive.org/details/{item_id}"
-    add_log(f"Upload Complete: {archive_url}")
-    bot.edit_message_text(
-        f"✅ **Upload Complete!**\n\n🔗 {archive_url}",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
-        parse_mode="Markdown",
-    )
-  except Exception as e:
-    add_log(f"Error: {str(e)}")
-    bot.edit_message_text(
-        f"❌ **Error:** {str(e)}",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
-    )
-  finally:
-    if os.path.exists(file_path):
-      os.remove(file_path)
-
-
+# --- DIRECT LINKS & YT-DLP HANDLER ---
 @bot.message_handler(func=lambda msg: True)
-def handle_direct_urls(message):
-  text = message.text.strip()
-  url_match = re.search(r"(https?://[^\s]+)", text)
+def handle_universal_url(message):
+    text = message.text.strip()
+    url_match = re.search(r'(https?://[^\s]+)', text)
+    
+    if not url_match:
+        bot.reply_to(message, "⚠️ Please send a valid link (YouTube, stream URL, or direct media link).")
+        return
 
-  if not url_match:
-    bot.reply_to(
-        message, "⚠️ Send a valid direct download link (e.g. `http.../video.mp4`)"
-    )
-    return
+    url = url_match.group(0)
 
-  url = url_match.group(0)
+    if "t.me/" in url and not ("t.me/c/" in url or "t.me/b/" in url):
+        bot.reply_to(message, "⚠️ For Telegram files, paste the direct stream link generated by a file-to-link service.")
+        return
 
-  if "t.me/" in url:
-    bot.reply_to(
-        message,
-        "❌ `t.me/...` links are Telegram web previews, not direct download"
-        " links.",
-    )
-    return
+    add_log(f"Received URL to process: {url}")
+    status = bot.reply_to(message, "⚡ **Analyzing link & fetching metadata...**", parse_mode="Markdown")
+    
+    item_id = f"auto_{uuid.uuid4().hex[:8]}"
+    output_template = f"/tmp/{item_id}.%(ext)s"
+    
+    last_update = [time.time()]
 
-  add_log(f"Starting direct URL download: {url}")
-  status = bot.reply_to(
-      message, "⚡ **Connecting to URL & calculating size...**"
-  )
-
-  item_id = f"archive_video_{uuid.uuid4().hex[:8]}"
-  file_path = f"/tmp/{item_id}.mp4"
-
-  try:
-    start_time = time.time()
-    last_update = [start_time]
-
-    with requests.get(url, stream=True, timeout=60) as r:
-      r.raise_for_status()
-      total_size = int(r.headers.get("content-length", 0))
-      downloaded = 0
-
-      with open(file_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-          if chunk:
-            f.write(chunk)
-            downloaded += len(chunk)
-
-            # Update progress bar every 3 seconds
+    # Progress hook for yt-dlp
+    def ytdl_hook(d):
+        if d['status'] == 'downloading':
             now = time.time()
             if now - last_update[0] >= 3:
-              last_update[0] = now
-              elapsed = now - start_time
-              speed = downloaded / elapsed if elapsed > 0 else 0
+                last_update[0] = now
+                downloaded = d.get('downloaded_bytes', 0)
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                speed = d.get('speed') or 0
+                eta = d.get('eta') or 0
 
-              if total_size > 0:
-                pct = (downloaded / total_size) * 100
-                filled = int(pct / 10)
-                bar = "■" * filled + "□" * (10 - filled)
-                eta = (total_size - downloaded) / speed if speed > 0 else 0
-                progress_text = (
-                    f"📥 **Downloading File...**\n\n"
-                    f"`[{bar}]` **{pct:.1f}%**\n\n"
-                    f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-                    f"📁 **Size:** `{format_size(downloaded)}` /"
-                    f" `{format_size(total_size)}`\n"
-                    f"⏳ **ETA:** `{int(eta)}s`"
-                )
-              else:
-                progress_text = (
-                    f"📥 **Downloading Stream...**\n\n"
-                    f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-                    f"📁 **Downloaded:** `{format_size(downloaded)}`"
-                )
+                if total > 0:
+                    pct = (downloaded / total) * 100
+                    filled = int(pct / 10)
+                    bar = "■" * filled + "□" * (10 - filled)
+                    text_prog = (
+                        f"📥 **Downloading Media...**\n\n"
+                        f"`[{bar}]` **{pct:.1f}%**\n\n"
+                        f"⚡ **Speed:** `{format_size(speed)}/s`\n"
+                        f"📁 **Size:** `{format_size(downloaded)}` / `{format_size(total)}`\n"
+                        f"⏳ **ETA:** `{eta}s`"
+                    )
+                else:
+                    text_prog = f"📥 **Downloading Stream...**\n\n⚡ **Speed:** `{format_size(speed)}/s`\n📁 **Downloaded:** `{format_size(downloaded)}`"
+                
+                try:
+                    bot.edit_message_text(text_prog, chat_id=message.chat.id, message_id=status.message_id, parse_mode="Markdown")
+                except Exception:
+                    pass
 
-              try:
-                bot.edit_message_text(
-                    progress_text,
-                    chat_id=message.chat.id,
-                    message_id=status.message_id,
-                    parse_mode="Markdown",
-                )
-              except Exception:
-                pass
+    ydl_opts = {
+        'outtmpl': output_template,
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'progress_hooks': [ytdl_hook],
+        'quiet': True,
+        'no_warnings': True
+    }
 
-    add_log(f"Downloaded {file_path}. Uploading to Internet Archive...")
-    bot.edit_message_text(
-        "🚀 **Uploading to Internet Archive... Please wait.**",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
-        parse_mode="Markdown",
-    )
+    try:
+        # 1. Attempt download using yt-dlp (YouTube, Social Media, Direct Streams)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get('title', f"Upload {item_id}")
+        except Exception:
+            # 2. Fallback to direct chunked streaming for pure binary file links
+            add_log(f"Falling back to direct stream downloader for: {url}")
+            file_path = f"/tmp/{item_id}.mp4"
+            title = f"Stream Upload {item_id}"
+            
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
 
-    item = ia.get_item(item_id)
-    item.upload(
-        file_path,
-        metadata={"title": f"Upload {item_id}", "mediatype": "movies"},
-        access_key=IA_ACCESS,
-        secret_key=IA_SECRET,
-    )
+        # Locate downloaded file
+        matching_files = glob.glob(f"/tmp/{item_id}.*")
+        if not matching_files:
+            raise Exception("File failed to download or save.")
 
-    archive_url = f"https://archive.org/details/{item_id}"
-    add_log(f"Upload Complete: {archive_url}")
-    bot.edit_message_text(
-        f"✅ **Upload Complete!**\n\n"
-        f"🔗 **Archive Link:** {archive_url}\n"
-        f"📦 **Size:** `{format_size(os.path.getsize(file_path))}`",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
-        parse_mode="Markdown",
-    )
+        downloaded_file_path = matching_files[0]
+        file_size = os.path.getsize(downloaded_file_path)
 
-  except Exception as e:
-    add_log(f"Upload failed: {str(e)}")
-    bot.edit_message_text(
-        f"❌ **Error:** {str(e)}",
-        chat_id=message.chat.id,
-        message_id=status.message_id,
-    )
-  finally:
-    if os.path.exists(file_path):
-      os.remove(file_path)
+        add_log(f"Download complete ({format_size(file_size)}). Uploading {item_id} to Internet Archive...")
+        bot.edit_message_text("🚀 **Uploading to Internet Archive... Please wait.**", chat_id=message.chat.id, message_id=status.message_id, parse_mode="Markdown")
 
+        # Upload to Internet Archive
+        item = ia.get_item(item_id)
+        item.upload(
+            downloaded_file_path,
+            metadata={"title": title, "mediatype": "movies"},
+            access_key=IA_ACCESS,
+            secret_key=IA_SECRET
+        )
+
+        archive_url = f"https://archive.org/details/{item_id}"
+        add_log(f"Upload Complete: {archive_url}")
+
+        bot.edit_message_text(
+            f"✅ **Upload Complete!**\n\n"
+            f"🎬 **Title:** `{title}`\n"
+            f"📦 **Size:** `{format_size(file_size)}`\n"
+            f"🔗 **Archive Link:** {archive_url}",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        add_log(f"Process Error: {str(e)}")
+        bot.edit_message_text(f"❌ **Error:** {str(e)}", chat_id=message.chat.id, message_id=status.message_id)
+
+    finally:
+        for f in glob.glob(f"/tmp/{item_id}.*"):
+            if os.path.exists(f):
+                os.remove(f)
 
 if __name__ == "__main__":
-  # Start web server for Render
-  t = threading.Thread(target=run_web, daemon=True)
-  t.start()
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
 
-  # Clear any old conflicting webhooks
-  try:
-    bot.remove_webhook()
-    time.sleep(1)
-  except Exception:
-    pass
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception:
+        pass
 
-  add_log("Bot started successfully. Listening for links and files...")
-  bot.infinity_polling(skip_pending=True)
+    add_log("Bot online. Multi-source universal downloader running...")
+    bot.infinity_polling(skip_pending=True)
