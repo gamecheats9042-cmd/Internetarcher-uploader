@@ -1,13 +1,11 @@
 import os
 import gc
-import io
 import uuid
 import time
 import email
 import urllib.parse
 import asyncio
 import threading
-import requests
 import internetarchive as ia
 from telethon import TelegramClient, events
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -88,7 +86,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Archive Direct Streamer</title>
+    <title>Archive Manager & Direct Uploader</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{ background: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; margin: 0; }}
@@ -110,7 +108,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">⚡ Zero-Disk Direct Stream Uploader</h2>
+            <h2 style="margin:0;">🚀 Internet Archive Hub</h2>
             <button class="btn" onclick="location.reload()">Refresh</button>
         </div>
 
@@ -119,16 +117,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <form method="POST" action="/upload" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                 <input type="file" name="file" required style="color:#94a3b8;">
                 <input type="text" name="custom_title" placeholder="Custom Title (Optional)" class="input-sm" style="flex:1;">
-                <button type="submit" class="btn">Stream to Archive</button>
+                <button type="submit" class="btn">Upload to Archive</button>
             </form>
         </div>
 
         <div class="card">
-            <h3 style="margin-top:0;">📁 Manage Archive Files</h3>
+            <h3 style="margin-top:0;">📁 Uploaded Files & Metadata</h3>
             <table>
                 <thead>
                     <tr>
-                        <th>Title / Video</th>
+                        <th>Title / File</th>
                         <th>Size</th>
                         <th>Archive URL</th>
                         <th>Rename</th>
@@ -179,28 +177,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
                 if uploaded_file_data:
                     item_id = f"web_{uuid.uuid4().hex[:8]}"
-                    clean_name = os.path.splitext(file_name)[0] if file_name else f"Upload_{item_id}"
-                    title = custom_title if custom_title else clean_name
-                    
-                    file_obj = io.BytesIO(uploaded_file_data)
+                    file_ext = os.path.splitext(file_name)[1] if file_name else ".mp4"
+                    raw_path = f"/tmp/{item_id}{file_ext}"
+                    clean_title = custom_title if custom_title else (os.path.splitext(file_name)[0] if file_name else f"Web Upload {item_id}")
+
+                    with open(raw_path, "wb") as f:
+                        f.write(uploaded_file_data)
+
                     file_size_fmt = format_size(len(uploaded_file_data))
-                    add_log(f"Streaming web file directly to Archive: {title} ({file_size_fmt})")
+                    add_log(f"Web Direct Upload processing: {clean_title} ({file_size_fmt})")
 
                     item = ia.get_item(item_id)
                     item.upload(
-                        {f"{clean_name}.mp4": file_obj},
+                        raw_path,
                         metadata={
-                            "title": title,
+                            "title": clean_title,
                             "mediatype": "movies",
-                            "collection": "opensource_movies"
+                            "collection": "opensource_movies",
+                            "format": "h.264"
                         },
                         access_key=IA_ACCESS,
                         secret_key=IA_SECRET
                     )
 
+                    if os.path.exists(raw_path):
+                        os.remove(raw_path)
+
                     archive_url = f"https://archive.org/details/{item_id}"
-                    uploaded_files_db.append({"id": item_id, "title": title, "size": file_size_fmt, "url": archive_url})
-                    add_log(f"Web Direct Upload complete: {archive_url}")
+                    uploaded_files_db.append({"id": item_id, "title": clean_title, "size": file_size_fmt, "url": archive_url})
+                    add_log(f"Web Upload Complete: {archive_url}")
 
             self.send_response(303)
             self.send_header("Location", "/")
@@ -242,66 +247,34 @@ def run_web():
 # ==============================================================================
 # TELETHON CLIENT INITIALIZATION
 # ==============================================================================
-bot = TelegramClient('direct_stream_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('tg_archive_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Progress tracking wrapper
-class StreamProgressFile:
-    def __init__(self, bot_client, message, total_size, status_msg, action_name):
-        self.bot = bot_client
-        self.message = message
-        self.total = total_size
-        self.current = 0
-        self.status_msg = status_msg
-        self.action_name = action_name
-        self.start_time = time.time()
-        self.last_update = self.start_time
+async def update_progress(current, total, status_msg, action_name, start_time, last_update):
+    now = time.time()
+    if now - last_update[0] < 3 and current != total:
+        return
+    last_update[0] = now
 
-    async def _update_ui(self):
-        now = time.time()
-        if now - self.last_update < 3 and self.current < self.total:
-            return
-        self.last_update = now
-
-        percentage = (self.current / self.total) * 100 if self.total > 0 else 0
-        filled = int(percentage / 10)
-        bar = "■" * filled + "□" * (10 - filled)
-        
-        elapsed = now - self.start_time
-        speed = self.current / elapsed if elapsed > 0 else 0
-        eta_seconds = (self.total - self.current) / speed if speed > 0 else 0
-        
-        text = (
-            f"🚀 **{self.action_name}**\n\n"
-            f"`[{bar}]` **{percentage:.1f}%**\n\n"
-            f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-            f"📁 **Streamed:** `{format_size(self.current)}` / `{format_size(self.total)}`\n"
-            f"⏳ **ETA:** `{format_eta(eta_seconds)}`"
-        )
-        try:
-            await self.status_msg.edit(text, parse_mode="markdown")
-        except Exception:
-            pass
-
-    async def stream_generator(self):
-        async for chunk in self.bot.iter_download(self.message.media, chunk_size=1024 * 1024):
-            self.current += len(chunk)
-            await self._update_ui()
-            yield chunk
-
-# Synchronous adapter for S3 upload streaming
-class SyncStreamIterator:
-    def __init__(self, async_gen, loop):
-        self.async_gen = async_gen
-        self.loop = loop
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        try:
-            return asyncio.run_coroutine_threadsafe(self.async_gen.__anext__(), self.loop).result()
-        except StopAsyncIteration:
-            raise StopIteration
+    percentage = (current / total) * 100 if total > 0 else 0
+    filled = int(percentage / 10)
+    bar = "■" * filled + "□" * (10 - filled)
+    
+    elapsed = now - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    eta_seconds = (total - current) / speed if speed > 0 else 0
+    eta_formatted = format_eta(eta_seconds)
+    
+    text = (
+        f"📊 **{action_name}**\n\n"
+        f"`[{bar}]` **{percentage:.1f}%**\n\n"
+        f"⚡ **Speed:** `{format_size(speed)}/s`\n"
+        f"📁 **Processed:** `{format_size(current)}` / `{format_size(total)}`\n"
+        f"⏳ **ETA:** `{eta_formatted}`"
+    )
+    try:
+        await status_msg.edit(text, parse_mode="markdown")
+    except Exception:
+        pass
 
 # ==============================================================================
 # TELEGRAM HANDLERS
@@ -310,10 +283,9 @@ class SyncStreamIterator:
 async def start_handler(event):
     add_log(f"Chat {event.chat_id} issued /start")
     await event.reply(
-        "⚡ **Direct Telegram to Internet Archive Streamer Ready!**\n\n"
+        "⚡ **Telegram to Internet Archive Uploader Ready!**\n\n"
         "Forward any video or `.mkv` file (up to 2GB) into this chat.\n"
-        "• Streams directly without storing or filling Render disk space\n"
-        "• Live real-time speed, ETA, and progress bar\n"
+        "• Direct S3 multipart upload with live ETA\n"
         "• Automatic web streaming playback on Archive.org"
     )
 
@@ -346,22 +318,35 @@ async def media_handler(event):
             )
             return
 
-        add_log(f"Direct stream pipe started: '{target_filename}' ({format_size(file_size)})")
-        status_msg = await event.reply("⚡ **Establishing direct pipe to Internet Archive...**")
+        add_log(f"Starting MTProto download: '{target_filename}' ({format_size(file_size)})")
+        status_msg = await event.reply("⏳ **Starting MTProto download from Telegram...**")
         item_id = f"tg_{uuid.uuid4().hex[:8]}"
+        temp_file_path = f"/tmp/{item_id}_{target_filename}"
 
         try:
-            loop = asyncio.get_running_loop()
-            progress_tracker = StreamProgressFile(bot, event.message, file_size, status_msg, "Streaming to Archive.org")
-            sync_stream = SyncStreamIterator(progress_tracker.stream_generator(), loop)
+            start_time = time.time()
+            last_update = [start_time]
 
+            # 1. Direct MTProto download to /tmp
+            await bot.download_media(
+                event.message.media,
+                file=temp_file_path,
+                progress_callback=lambda c, t: update_progress(
+                    c, t, status_msg, "Downloading Media", start_time, last_update
+                )
+            )
+
+            add_log(f"Download complete: {temp_file_path}. Uploading to Archive.org S3 endpoint...")
+            await status_msg.edit("🚀 **Uploading to Internet Archive... Please wait.**")
+
+            # 2. Native Multipart S3 upload with mediatype and playback format
+            loop = asyncio.get_running_loop()
             item = ia.get_item(item_id)
 
-            # Direct cloud upload without disk caching
             await loop.run_in_executor(
                 None,
                 lambda: item.upload(
-                    {target_filename: sync_stream},
+                    temp_file_path,
                     metadata={
                         "title": clean_base,
                         "mediatype": "movies",
@@ -381,7 +366,7 @@ async def media_handler(event):
                 "url": archive_url
             })
 
-            add_log(f"Direct stream complete: {archive_url}")
+            add_log(f"Upload complete: {archive_url}")
             await status_msg.edit(
                 f"✅ **Upload Complete!**\n\n"
                 f"🎬 **File Name:** `{target_filename}`\n"
@@ -391,9 +376,11 @@ async def media_handler(event):
             )
 
         except Exception as e:
-            add_log(f"Stream error: {str(e)}")
+            add_log(f"Upload error: {str(e)}")
             await status_msg.edit(f"❌ **Error:** `{str(e)}`")
         finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
             gc.collect()
 
 # ==============================================================================
@@ -403,5 +390,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Zero-Disk Direct Stream Bot online.")
+    add_log("Telegram Media Uploader online with S3 Multipart Upload.")
     bot.run_until_disconnected()
