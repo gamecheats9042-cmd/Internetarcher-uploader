@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import uuid
 import time
 import email
@@ -25,7 +26,6 @@ IA_SECRET = "THTnm9iXNVafYy9b"
 logs_history = []
 uploaded_files_db = []
 
-# Get the exact standalone ffmpeg executable path
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 def add_log(msg):
@@ -37,7 +37,7 @@ def add_log(msg):
         logs_history.pop(0)
 
 # ==============================================================================
-# FORMATTING & VIDEO REMUX ENGINE
+# FORMATTING & TIME UTILITIES
 # ==============================================================================
 def format_size(bytes_size):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -60,43 +60,93 @@ def format_eta(seconds):
     else:
         return f"{secs}s"
 
-def convert_mkv_to_mp4(input_path):
-    """Converts/remuxes any MKV/video into standard fast-start web playable MP4"""
+def get_video_duration(file_path):
+    """Fetch total video duration in seconds for accurate conversion ETA"""
+    try:
+        cmd = [FFMPEG_BIN, "-i", file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr)
+        if match:
+            hours, mins, secs = map(float, match.groups())
+            return hours * 3600 + mins * 60 + secs
+    except Exception:
+        pass
+    return 0
+
+# ==============================================================================
+# LIVE FFMPEG CONVERSION WITH ETA
+# ==============================================================================
+async def convert_mkv_to_mp4_with_progress(input_path, status_msg):
     base, _ = os.path.splitext(input_path)
     output_path = f"{base}_streamable.mp4"
-
-    add_log(f"Remuxing video to web MP4 using FFmpeg: {input_path}")
+    total_duration = get_video_duration(input_path)
     
-    # 1. Fast stream copy with faststart (Instant remuxing for H.264/AAC)
+    add_log(f"Starting MKV -> MP4 fast remux: {input_path}")
+    
+    # Fast copy streams (H.264 video + AAC audio) with web-streaming moov atom at start
     cmd = [
         FFMPEG_BIN, "-y", "-i", input_path,
-        "-c:v", "copy", "-c:a", "copy",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         output_path
     ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            add_log("Fast remuxing to MP4 successful.")
-            return output_path
-    except Exception as e:
-        add_log(f"Remux fast copy failed: {str(e)}")
 
-    # 2. Fallback: Convert audio to AAC if MKV audio format is incompatible
-    cmd_fallback = [
-        FFMPEG_BIN, "-y", "-i", input_path,
-        "-c:v", "copy", "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path
-    ]
     try:
-        res = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            add_log("Audio-transcoded remux to MP4 successful.")
-            return output_path
-    except Exception as e:
-        add_log(f"Remux fallback failed: {str(e)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
+        start_time = time.time()
+        last_update = start_time
+
+        while process.returncode is None:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            line_str = line.decode('utf-8', errors='ignore')
+
+            time_match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line_str)
+            if time_match and total_duration > 0:
+                hours, mins, secs = map(float, time_match.groups())
+                current_time = hours * 3600 + mins * 60 + secs
+                now = time.time()
+
+                if now - last_update >= 3:
+                    last_update = now
+                    pct = min(100.0, (current_time / total_duration) * 100)
+                    filled = int(pct / 10)
+                    bar = "■" * filled + "□" * (10 - filled)
+                    
+                    elapsed = now - start_time
+                    speed = current_time / elapsed if elapsed > 0 else 1
+                    eta = max(0, (total_duration - current_time) / speed)
+
+                    text = (
+                        f"⚙️ **Converting MKV to Browser Streamable MP4**\n\n"
+                        f"`[{bar}]` **{pct:.1f}%**\n\n"
+                        f"⏱️ **Processed:** `{format_eta(current_time)}` / `{format_eta(total_duration)}`\n"
+                        f"⏳ **Conversion ETA:** `{format_eta(eta)}`"
+                    )
+                    try:
+                        await status_msg.edit(text, parse_mode="markdown")
+                    except Exception:
+                        pass
+
+        await process.wait()
+
+        if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            add_log(f"Conversion finished: {output_path}")
+            # Delete original to save disk space
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            return output_path
+
+    except Exception as e:
+        add_log(f"FFmpeg conversion error: {str(e)}")
+
+    add_log("Using original file as fallback.")
     return input_path
 
 # ==============================================================================
@@ -117,7 +167,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <tr>
                 <td><b>{f['title']}</b></td>
                 <td>{f['size']}</td>
-                <td><a href="{f['url']}" target="_blank" class="link-btn">▶️ Play Online</a></td>
+                <td><a href="{f['url']}" target="_blank" class="link-btn">▶️ Stream Online</a></td>
                 <td>
                     <form method="POST" action="/rename" style="display:inline-flex; gap: 5px;">
                         <input type="hidden" name="item_id" value="{f['id']}">
@@ -155,7 +205,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">🚀 Internet Archive Hub (MKV -> MP4 Playable)</h2>
+            <h2 style="margin:0;">🚀 Internet Archive Hub (MKV -> MP4 Auto-Stream)</h2>
             <button class="btn" onclick="location.reload()">Refresh</button>
         </div>
 
@@ -231,25 +281,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     with open(raw_path, "wb") as f:
                         f.write(uploaded_file_data)
 
-                    final_path = convert_mkv_to_mp4(raw_path)
-                    file_size_fmt = format_size(os.path.getsize(final_path))
+                    file_size_fmt = format_size(len(uploaded_file_data))
                     add_log(f"Web Direct Upload processing: {clean_title} ({file_size_fmt})")
 
                     item = ia.get_item(item_id)
                     item.upload(
-                        final_path,
+                        raw_path,
                         metadata={
                             "title": clean_title,
                             "mediatype": "movies",
-                            "collection": "opensource_movies"
+                            "collection": "opensource_movies",
+                            "format": "h.264"
                         },
                         access_key=IA_ACCESS,
                         secret_key=IA_SECRET
                     )
 
-                    for p in [raw_path, final_path]:
-                        if os.path.exists(p):
-                            os.remove(p)
+                    if os.path.exists(raw_path):
+                        os.remove(raw_path)
 
                     archive_url = f"https://archive.org/details/{item_id}"
                     uploaded_files_db.append({"id": item_id, "title": clean_title, "size": file_size_fmt, "url": archive_url})
@@ -332,10 +381,10 @@ async def update_progress(current, total, status_msg, action_name, start_time, l
 async def start_handler(event):
     add_log(f"Chat {event.chat_id} issued /start")
     await event.reply(
-        "👋 **Telegram Video & Movie Uploader Ready!**\n\n"
+        "👋 **Telegram Movie & Video Uploader Ready!**\n\n"
         "Forward any `.mkv` or `.mp4` video (up to 2GB) into this chat.\n"
-        "• Automatically converts MKV to web-streamable MP4\n"
-        "• Displays live ETA (hrs/mins/secs) and progress bar"
+        "• Live Download ETA & Conversion Progress\n"
+        "• Automatic MP4 remuxing for instant online streaming on Archive.org"
     )
 
 @bot.on(events.NewMessage)
@@ -357,7 +406,7 @@ async def media_handler(event):
         file_size = event.message.file.size if event.message.file else 0
 
         if file_size > 2000 * 1024 * 1024:
-            add_log(f"File {file_name} ({format_size(file_size)}) exceeds Telegram bot limit of 2GB.")
+            add_log(f"File {file_name} ({format_size(file_size)}) exceeds 2GB limit.")
             await event.reply(
                 f"⚠️ **File is too large ({format_size(file_size)})!**\n\n"
                 f"Telegram server restrictions disconnect bot tokens at **2.00 GB**.\n"
@@ -379,23 +428,20 @@ async def media_handler(event):
                 event.message.media,
                 file=raw_path,
                 progress_callback=lambda c, t: update_progress(
-                    c, t, status_msg, "Downloading File", start_time, last_update
+                    c, t, status_msg, "Downloading Media", start_time, last_update
                 )
             )
 
-            await status_msg.edit("⚙️ **Converting MKV to streamable MP4 for browser playback...**")
-            
-            # Execute conversion
-            loop = asyncio.get_running_loop()
-            final_path = await loop.run_in_executor(None, lambda: convert_mkv_to_mp4(raw_path))
+            # Convert with Live ETA
+            final_path = await convert_mkv_to_mp4_with_progress(raw_path, status_msg)
 
             add_log(f"Uploading {final_path} to Archive.org...")
             await status_msg.edit("🚀 **Uploading to Internet Archive... Please wait.**")
 
             clean_title = os.path.splitext(file_name)[0]
+            loop = asyncio.get_running_loop()
             item = ia.get_item(item_id)
             
-            # Upload streamable MP4 with movies mediatype
             await loop.run_in_executor(
                 None,
                 lambda: item.upload(
@@ -403,7 +449,8 @@ async def media_handler(event):
                     metadata={
                         "title": clean_title,
                         "mediatype": "movies",
-                        "collection": "opensource_movies"
+                        "collection": "opensource_movies",
+                        "format": "h.264"
                     },
                     access_key=IA_ACCESS,
                     secret_key=IA_SECRET
@@ -424,7 +471,7 @@ async def media_handler(event):
                 f"✅ **Upload Complete!**\n\n"
                 f"🎬 **File Name:** `{clean_title}.mp4`\n"
                 f"📦 **Size:** `{final_size_fmt}`\n"
-                f"▶️ **Play Online:** {archive_url}",
+                f"▶️ **Stream Online:** {archive_url}",
                 link_preview=True
             )
 
@@ -444,6 +491,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log(f"Telegram Media Uploader online with FFmpeg at {FFMPEG_BIN}")
+    add_log(f"Telegram Media Uploader online with live conversion progress.")
     bot.run_until_disconnected()
-        
