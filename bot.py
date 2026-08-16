@@ -31,6 +31,9 @@ def add_log(msg):
     if len(logs_history) > 60:
         logs_history.pop(0)
 
+# ==============================================================================
+# FORMATTING UTILITIES
+# ==============================================================================
 def format_size(bytes_size):
     for unit in ['B', 'KB', 'MB', 'GB']:
         if bytes_size < 1024:
@@ -51,6 +54,65 @@ def format_eta(seconds):
         return f"{mins}m {secs}s"
     else:
         return f"{secs}s"
+
+# ==============================================================================
+# PROGRESS FILE WRAPPER FOR ARCHIVE.ORG UPLOADS
+# ==============================================================================
+class ProgressFileReader(object):
+    """File-like wrapper that tracks bytes read by InternetArchive S3 and updates Telegram UI."""
+    def __init__(self, filepath, status_msg, loop, total_size):
+        self._file = open(filepath, 'rb')
+        self.total_size = total_size
+        self.bytes_read = 0
+        self.status_msg = status_msg
+        self.loop = loop
+        self.start_time = time.time()
+        self.last_update = self.start_time
+
+    def read(self, size=-1):
+        data = self._file.read(size)
+        if data:
+            self.bytes_read += len(data)
+            now = time.time()
+            if (now - self.last_update >= 3) or (self.bytes_read >= self.total_size):
+                self.last_update = now
+                pct = (self.bytes_read / self.total_size) * 100 if self.total_size > 0 else 0
+                filled = int(pct / 10)
+                bar = "■" * filled + "□" * (10 - filled)
+                elapsed = now - self.start_time
+                speed = self.bytes_read / elapsed if elapsed > 0 else 0
+                eta_seconds = (self.total_size - self.bytes_read) / speed if speed > 0 else 0
+                
+                text = (
+                    f"🚀 **Uploading to Internet Archive**\n\n"
+                    f"`[{bar}]` **{pct:.1f}%**\n\n"
+                    f"⚡ **Speed:** `{format_size(speed)}/s`\n"
+                    f"📁 **Uploaded:** `{format_size(self.bytes_read)}` / `{format_size(self.total_size)}`\n"
+                    f"⏳ **ETA:** `{format_eta(eta_seconds)}`"
+                )
+                asyncio.run_coroutine_threadsafe(self.safe_edit(text), self.loop)
+        return data
+
+    async def safe_edit(self, text):
+        try:
+            await self.status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    def seek(self, offset, whence=0):
+        return self._file.seek(offset, whence)
+
+    def tell(self):
+        return self._file.tell()
+
+    def close(self):
+        self._file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 # ==============================================================================
 # WEB SERVER & MANAGEMENT DASHBOARD
@@ -185,7 +247,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         f.write(uploaded_file_data)
 
                     file_size_fmt = format_size(len(uploaded_file_data))
-                    add_log(f"Web Direct Upload processing: {clean_title} ({file_size_fmt})")
+                    add_log(f"Web Direct Upload: {clean_title} ({file_size_fmt})")
 
                     item = ia.get_item(item_id)
                     item.upload(
@@ -249,7 +311,7 @@ def run_web():
 # ==============================================================================
 bot = TelegramClient('tg_archive_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-async def update_progress(current, total, status_msg, action_name, start_time, last_update):
+async def update_download_progress(current, total, status_msg, action_name, start_time, last_update):
     now = time.time()
     if now - last_update[0] < 3 and current != total:
         return
@@ -265,10 +327,10 @@ async def update_progress(current, total, status_msg, action_name, start_time, l
     eta_formatted = format_eta(eta_seconds)
     
     text = (
-        f"📊 **{action_name}**\n\n"
+        f"📥 **{action_name}**\n\n"
         f"`[{bar}]` **{percentage:.1f}%**\n\n"
         f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-        f"📁 **Processed:** `{format_size(current)}` / `{format_size(total)}`\n"
+        f"📁 **Downloaded:** `{format_size(current)}` / `{format_size(total)}`\n"
         f"⏳ **ETA:** `{eta_formatted}`"
     )
     try:
@@ -285,8 +347,8 @@ async def start_handler(event):
     await event.reply(
         "⚡ **Telegram to Internet Archive Uploader Ready!**\n\n"
         "Forward any video or `.mkv` file (up to 2GB) into this chat.\n"
-        "• Direct S3 multipart upload with live ETA\n"
-        "• Automatic web streaming playback on Archive.org"
+        "• Live download & upload progress bars with ETA\n"
+        "• Direct streamable playback on Archive.org"
     )
 
 @bot.on(events.NewMessage)
@@ -318,7 +380,7 @@ async def media_handler(event):
             )
             return
 
-        add_log(f"Starting MTProto download: '{target_filename}' ({format_size(file_size)})")
+        add_log(f"Starting transfer: '{target_filename}' ({format_size(file_size)})")
         status_msg = await event.reply("⏳ **Starting MTProto download from Telegram...**")
         item_id = f"tg_{uuid.uuid4().hex[:8]}"
         temp_file_path = f"/tmp/{item_id}_{target_filename}"
@@ -327,42 +389,44 @@ async def media_handler(event):
             start_time = time.time()
             last_update = [start_time]
 
-            # 1. Direct MTProto download to /tmp
+            # 1. Download file from Telegram with live ETA
             await bot.download_media(
                 event.message.media,
                 file=temp_file_path,
-                progress_callback=lambda c, t: update_progress(
-                    c, t, status_msg, "Downloading Media", start_time, last_update
+                progress_callback=lambda c, t: update_download_progress(
+                    c, t, status_msg, "Downloading from Telegram", start_time, last_update
                 )
             )
 
-            add_log(f"Download complete: {temp_file_path}. Uploading to Archive.org S3 endpoint...")
-            await status_msg.edit("🚀 **Uploading to Internet Archive... Please wait.**")
+            add_log(f"Download complete. Uploading to Internet Archive with live progress...")
+            await status_msg.edit("🚀 **Starting upload to Internet Archive...**")
 
-            # 2. Native Multipart S3 upload with mediatype and playback format
+            # 2. Upload to Archive.org with live upload progress tracking
             loop = asyncio.get_running_loop()
+            actual_size = os.path.getsize(temp_file_path)
             item = ia.get_item(item_id)
 
-            await loop.run_in_executor(
-                None,
-                lambda: item.upload(
-                    temp_file_path,
-                    metadata={
-                        "title": clean_base,
-                        "mediatype": "movies",
-                        "collection": "opensource_movies",
-                        "format": "h.264"
-                    },
-                    access_key=IA_ACCESS,
-                    secret_key=IA_SECRET
-                )
-            )
+            def perform_upload():
+                with ProgressFileReader(temp_file_path, status_msg, loop, actual_size) as progress_file:
+                    item.upload(
+                        {target_filename: progress_file},
+                        metadata={
+                            "title": clean_base,
+                            "mediatype": "movies",
+                            "collection": "opensource_movies",
+                            "format": "h.264"
+                        },
+                        access_key=IA_ACCESS,
+                        secret_key=IA_SECRET
+                    )
+
+            await loop.run_in_executor(None, perform_upload)
 
             archive_url = f"https://archive.org/details/{item_id}"
             uploaded_files_db.append({
                 "id": item_id,
                 "title": clean_base,
-                "size": format_size(file_size),
+                "size": format_size(actual_size),
                 "url": archive_url
             })
 
@@ -370,13 +434,13 @@ async def media_handler(event):
             await status_msg.edit(
                 f"✅ **Upload Complete!**\n\n"
                 f"🎬 **File Name:** `{target_filename}`\n"
-                f"📦 **Size:** `{format_size(file_size)}`\n"
+                f"📦 **Size:** `{format_size(actual_size)}`\n"
                 f"▶️ **Play Online:** {archive_url}",
                 link_preview=True
             )
 
         except Exception as e:
-            add_log(f"Upload error: {str(e)}")
+            add_log(f"Transfer error: {str(e)}")
             await status_msg.edit(f"❌ **Error:** `{str(e)}`")
         finally:
             if os.path.exists(temp_file_path):
@@ -390,5 +454,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Telegram Media Uploader online with S3 Multipart Upload.")
+    add_log("Telegram Media Uploader online with 2-Stage ETA tracking.")
     bot.run_until_disconnected()
