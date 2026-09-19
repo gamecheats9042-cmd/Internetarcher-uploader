@@ -1,3 +1,39 @@
+import sys
+import subprocess
+
+# ==============================================================================
+# AUTO-INSTALL DEPENDENCIES ON RUNTIME
+# ==============================================================================
+REQUIRED_PACKAGES = [
+    "Telethon",
+    "internetarchive",
+    "requests",
+    "cryptg",
+    "boto3"
+]
+
+def ensure_dependencies():
+    missing = []
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(pkg.lower())
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print(f"📦 Installing missing dependencies: {', '.join(missing)}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("✅ Dependencies installed successfully!\n")
+        except Exception as e:
+            print(f"❌ Failed to auto-install dependencies: {e}")
+            sys.exit(1)
+
+ensure_dependencies()
+
+# ==============================================================================
+# CORE MODULE IMPORTS
+# ==============================================================================
 import os
 import gc
 import uuid
@@ -429,7 +465,7 @@ async def start_handler(event):
     await event.reply(
         "⚡ **Telegram to Internet Archive Hub V2 Ready!**\n\n"
         "• Send or forward any video or file (up to 2GB).\n"
-        "• **Persistent Resume:** If the server or VS Code restarts, the download/upload automatically picks up where it left off.\n"
+        "• **Persistent Resume:** If the server restarts or goes offline, downloads and uploads continue from where they left off.\n"
         "• **Inline Controls:** Pause, Resume, or Cancel anytime using the interactive buttons."
     )
 
@@ -509,15 +545,16 @@ async def media_handler(event):
         asyncio.create_task(execute_transfer(task_id, bot))
 
 # ==============================================================================
-# MAIN ENTRY POINT
+# MAIN ENTRY POINT (Clean Async Startup, No Deprecation Warnings)
 # ==============================================================================
+async def main():
+    await bot.start(bot_token=BOT_TOKEN)
+    asyncio.create_task(resume_interrupted_tasks(bot))
+    await bot.run_until_disconnected()
+
 if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
     add_log("Telegram Media Uploader V2 online with persistent DB & Controls.")
-
-    loop = asyncio.get_event_loop()
-    bot.start(bot_token=BOT_TOKEN)
-    loop.create_task(resume_interrupted_tasks(bot))
-    bot.run_until_disconnected()
+    asyncio.run(main())
