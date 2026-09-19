@@ -1,4 +1,5 @@
-telethon
+Telethon
 internetarchive
 requests
 cryptg
+boto3
