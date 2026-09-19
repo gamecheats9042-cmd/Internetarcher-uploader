@@ -2,23 +2,32 @@ import os
 import gc
 import uuid
 import time
-import email
-import urllib.parse
+import json
+import sqlite3
 import asyncio
 import threading
-import internetarchive as ia
-from telethon import TelegramClient, events
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import boto3
+from botocore.client import Config
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeFilename
 
 # ==============================================================================
 # CREDENTIALS & CONFIGURATION
 # ==============================================================================
 API_ID = int(os.getenv("TELEGRAM_API_ID", "2040"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = "8644006980:AAEKBACweZ9kg4M482anjYUkEP5O7DZF7wQ"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8644006980:AAEKBACweZ9kg4M482anjYUkEP5O7DZF7wQ")
 
-IA_ACCESS = "SjzCWtMdMVYsRBXl"
-IA_SECRET = "THTnm9iXNVafYy9b"
+IA_ACCESS = os.getenv("IA_ACCESS_KEY", "SjzCWtMdMVYsRBXl")
+IA_SECRET = os.getenv("IA_SECRET_KEY", "THTnm9iXNVafYy9b")
+
+DB_FILE = "tasks.db"
+DOWNLOAD_DIR = "/tmp/archive_hub"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB chunks
+active_tasks = {}
 
 logs_history = []
 uploaded_files_db = []
@@ -32,7 +41,44 @@ def add_log(msg):
         logs_history.pop(0)
 
 # ==============================================================================
-# FORMATTING UTILITIES
+# DATABASE MANAGEMENT (Preserves Tasks Across Bot Restarts & Offline Events)
+# ==============================================================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS transfers (
+            task_id TEXT PRIMARY KEY,
+            chat_id INTEGER,
+            msg_id INTEGER,
+            status_msg_id INTEGER,
+            file_name TEXT,
+            total_size INTEGER,
+            downloaded_bytes INTEGER,
+            uploaded_bytes INTEGER,
+            stage TEXT,
+            status TEXT,
+            local_path TEXT,
+            s3_upload_id TEXT,
+            s3_parts_json TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def db_execute(query, params=()):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(query, params)
+    conn.commit()
+    res = c.fetchall()
+    conn.close()
+    return res
+
+init_db()
+
+# ==============================================================================
+# FORMATTING UTILITIES & INLINE BUTTONS
 # ==============================================================================
 def format_size(bytes_size):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -47,72 +93,251 @@ def format_eta(seconds):
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    
     if hrs > 0:
         return f"{hrs}h {mins}m {secs}s"
     elif mins > 0:
         return f"{mins}m {secs}s"
-    else:
-        return f"{secs}s"
+    return f"{secs}s"
+
+def make_keyboard(task_id, is_paused=False):
+    if is_paused:
+        return [
+            [Button.inline("▶️ Resume", data=f"resume:{task_id}"),
+             Button.inline("❌ Cancel", data=f"cancel:{task_id}")]
+        ]
+    return [
+        [Button.inline("⏸ Pause", data=f"pause:{task_id}"),
+         Button.inline("❌ Cancel", data=f"cancel:{task_id}")]
+    ]
 
 # ==============================================================================
-# PROGRESS FILE WRAPPER FOR ARCHIVE.ORG UPLOADS
+# S3 CLIENT (Direct Multipart Support for Internet Archive)
 # ==============================================================================
-class ProgressFileReader(object):
-    """File-like wrapper that tracks bytes read by InternetArchive S3 and updates Telegram UI."""
-    def __init__(self, filepath, status_msg, loop, total_size):
-        self._file = open(filepath, 'rb')
-        self.total_size = total_size
-        self.bytes_read = 0
-        self.status_msg = status_msg
-        self.loop = loop
-        self.start_time = time.time()
-        self.last_update = self.start_time
+def get_ia_s3_client():
+    return boto3.client(
+        's3',
+        endpoint_url='https://s3.us.archive.org',
+        aws_access_key_id=IA_ACCESS,
+        aws_secret_access_key=IA_SECRET,
+        config=Config(signature_version='s3')
+    )
 
-    def read(self, size=-1):
-        data = self._file.read(size)
-        if data:
-            self.bytes_read += len(data)
-            now = time.time()
-            if (now - self.last_update >= 3) or (self.bytes_read >= self.total_size):
-                self.last_update = now
-                pct = (self.bytes_read / self.total_size) * 100 if self.total_size > 0 else 0
-                filled = int(pct / 10)
-                bar = "■" * filled + "□" * (10 - filled)
-                elapsed = now - self.start_time
-                speed = self.bytes_read / elapsed if elapsed > 0 else 0
-                eta_seconds = (self.total_size - self.bytes_read) / speed if speed > 0 else 0
-                
-                text = (
-                    f"🚀 **Uploading to Internet Archive**\n\n"
-                    f"`[{bar}]` **{pct:.1f}%**\n\n"
-                    f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-                    f"📁 **Uploaded:** `{format_size(self.bytes_read)}` / `{format_size(self.total_size)}`\n"
-                    f"⏳ **ETA:** `{format_eta(eta_seconds)}`"
-                )
-                asyncio.run_coroutine_threadsafe(self.safe_edit(text), self.loop)
-        return data
+# ==============================================================================
+# TRANSFER ENGINE (Auto-Resume Telegram Download & S3 Upload)
+# ==============================================================================
+async def execute_transfer(task_id, bot_client):
+    rows = db_execute("SELECT * FROM transfers WHERE task_id=?", (task_id,))
+    if not rows:
+        return
+    
+    r = rows[0]
+    chat_id, msg_id, status_msg_id = r[1], r[2], r[3]
+    file_name, total_size = r[4], r[5]
+    stage, local_path = r[8], r[10]
+    s3_upload_id, s3_parts_json = r[11], r[12]
 
-    async def safe_edit(self, text):
+    if task_id not in active_tasks:
+        evt = asyncio.Event()
+        evt.set()
+        active_tasks[task_id] = {"pause": evt, "cancel": False}
+
+    ctrl = active_tasks[task_id]
+
+    async def send_progress(curr, tot, speed, eta, step_name):
+        pct = (curr / tot * 100) if tot > 0 else 0
+        filled = int(pct / 10)
+        bar = "■" * filled + "□" * (10 - filled)
+        status_text = "⏸ Paused" if not ctrl["pause"].is_set() else f"⚡ `{format_size(speed)}/s`"
+        text = (
+            f"🚀 **{step_name}**\n\n"
+            f"`[{bar}]` **{pct:.1f}%**\n\n"
+            f"**Status:** {status_text}\n"
+            f"📁 **Processed:** `{format_size(curr)}` / `{format_size(tot)}`\n"
+            f"⏳ **ETA:** `{format_eta(eta)}`"
+        )
         try:
-            await self.status_msg.edit(text, parse_mode="markdown")
+            await bot_client.edit_message(
+                chat_id, status_msg_id, text,
+                buttons=make_keyboard(task_id, is_paused=not ctrl["pause"].is_set())
+            )
         except Exception:
             pass
 
-    def seek(self, offset, whence=0):
-        return self._file.seek(offset, whence)
+    # STAGE 1: RESUMABLE TELEGRAM DOWNLOAD
+    if stage == "downloading":
+        original_msg = await bot_client.get_messages(chat_id, ids=msg_id)
+        if not original_msg or not original_msg.media:
+            add_log(f"Task {task_id} media missing.")
+            return
 
-    def tell(self):
-        return self._file.tell()
+        current_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        start_time = time.time()
+        last_update = start_time
+        downloaded_session = 0
 
-    def close(self):
-        self._file.close()
+        with open(local_path, "ab") as f:
+            async for chunk in bot_client.iter_download(original_msg.media, offset=current_size, chunk_size=CHUNK_SIZE):
+                while not ctrl["pause"].is_set():
+                    await asyncio.sleep(0.5)
 
-    def __enter__(self):
-        return self
+                if ctrl["cancel"]:
+                    add_log(f"Task {task_id} cancelled during download.")
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    db_execute("DELETE FROM transfers WHERE task_id=?", (task_id,))
+                    await bot_client.edit_message(chat_id, status_msg_id, "❌ **Task Cancelled.**", buttons=None)
+                    return
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+                f.write(chunk)
+                current_size += len(chunk)
+                downloaded_session += len(chunk)
+
+                now = time.time()
+                if (now - last_update >= 3) or (current_size >= total_size):
+                    elapsed = now - start_time
+                    speed = downloaded_session / elapsed if elapsed > 0 else 0
+                    eta = (total_size - current_size) / speed if speed > 0 else 0
+                    last_update = now
+
+                    db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
+                    await send_progress(current_size, total_size, speed, eta, "Downloading from Telegram")
+
+        stage = "uploading"
+        db_execute("UPDATE transfers SET stage='uploading' WHERE task_id=?", (task_id,))
+        add_log(f"Download complete: {local_path}")
+
+    # STAGE 2: RESUMABLE MULTIPART S3 UPLOAD (INTERNET ARCHIVE)
+    if stage == "uploading":
+        s3 = get_ia_s3_client()
+        bucket = task_id
+        key = file_name
+        parts = json.loads(s3_parts_json) if s3_parts_json else []
+
+        if not s3_upload_id:
+            try:
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={'LocationConstraint': ''}
+                )
+            except Exception:
+                pass
+
+            mp = s3.create_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                Metadata={
+                    "mediatype": "movies",
+                    "collection": "opensource_movies",
+                    "title": os.path.splitext(file_name)[0]
+                }
+            )
+            s3_upload_id = mp['UploadId']
+            db_execute("UPDATE transfers SET s3_upload_id=? WHERE task_id=?", (s3_upload_id, task_id))
+
+        total_parts = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        uploaded_part_nums = {p["PartNumber"] for p in parts}
+
+        start_time = time.time()
+        last_update = start_time
+        uploaded_bytes = sum([CHUNK_SIZE for p in parts if p["PartNumber"] < total_parts])
+        upload_session_bytes = 0
+
+        with open(local_path, "rb") as f:
+            for part_num in range(1, total_parts + 1):
+                while not ctrl["pause"].is_set():
+                    await asyncio.sleep(0.5)
+
+                if ctrl["cancel"]:
+                    add_log(f"Task {task_id} cancelled during upload.")
+                    try:
+                        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=s3_upload_id)
+                    except Exception:
+                        pass
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    db_execute("DELETE FROM transfers WHERE task_id=?", (task_id,))
+                    await bot_client.edit_message(chat_id, status_msg_id, "❌ **Task Cancelled.**", buttons=None)
+                    return
+
+                offset = (part_num - 1) * CHUNK_SIZE
+                f.seek(offset)
+                chunk_data = f.read(CHUNK_SIZE)
+
+                if part_num in uploaded_part_nums:
+                    continue
+
+                res = s3.upload_part(
+                    Bucket=bucket,
+                    Key=key,
+                    PartNumber=part_num,
+                    UploadId=s3_upload_id,
+                    Body=chunk_data
+                )
+                etag = res['ETag']
+                parts.append({"PartNumber": part_num, "ETag": etag})
+                uploaded_part_nums.add(part_num)
+
+                uploaded_bytes += len(chunk_data)
+                upload_session_bytes += len(chunk_data)
+
+                now = time.time()
+                elapsed = now - start_time
+                speed = upload_session_bytes / elapsed if elapsed > 0 else 0
+                eta = (total_size - uploaded_bytes) / speed if speed > 0 else 0
+
+                db_execute(
+                    "UPDATE transfers SET uploaded_bytes=?, s3_parts_json=? WHERE task_id=?",
+                    (uploaded_bytes, json.dumps(parts), task_id)
+                )
+
+                if (now - last_update >= 3) or (uploaded_bytes >= total_size):
+                    last_update = now
+                    await send_progress(uploaded_bytes, total_size, speed, eta, "Uploading to Internet Archive")
+
+        # Finalize multipart upload
+        parts = sorted(parts, key=lambda p: p["PartNumber"])
+        s3.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=s3_upload_id,
+            MultipartUpload={"Parts": parts}
+        )
+
+        archive_url = f"https://archive.org/details/{bucket}"
+        uploaded_files_db.append({
+            "id": bucket,
+            "title": os.path.splitext(file_name)[0],
+            "size": format_size(total_size),
+            "url": archive_url
+        })
+        add_log(f"Upload complete: {archive_url}")
+
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        db_execute("DELETE FROM transfers WHERE task_id=?", (task_id,))
+
+        await bot_client.edit_message(
+            chat_id,
+            status_msg_id,
+            f"✅ **Upload Complete!**\n\n"
+            f"🎬 **File Name:** `{file_name}`\n"
+            f"📦 **Size:** `{format_size(total_size)}`\n"
+            f"▶️ **Play Online:** {archive_url}",
+            buttons=None,
+            link_preview=True
+        )
+        gc.collect()
+
+# ==============================================================================
+# RESTART RECOVERY (Runs after offline or crash)
+# ==============================================================================
+async def resume_interrupted_tasks(bot_client):
+    await asyncio.sleep(2)
+    rows = db_execute("SELECT task_id FROM transfers")
+    for r in rows:
+        t_id = r[0]
+        add_log(f"Restoring interrupted task: {t_id}")
+        asyncio.create_task(execute_transfer(t_id, bot_client))
 
 # ==============================================================================
 # WEB SERVER & MANAGEMENT DASHBOARD
@@ -125,7 +350,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         log_rows = "".join([f"<div class='log-row'>{log}</div>" for log in reversed(logs_history)]) or "<div class='log-row'>No activity recorded yet...</div>"
-        
         file_rows = ""
         for f in reversed(uploaded_files_db):
             file_rows += f"""
@@ -133,22 +357,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <td><b>{f['title']}</b></td>
                 <td>{f['size']}</td>
                 <td><a href="{f['url']}" target="_blank" class="link-btn">▶️ Play Online</a></td>
-                <td>
-                    <form method="POST" action="/rename" style="display:inline-flex; gap: 5px;">
-                        <input type="hidden" name="item_id" value="{f['id']}">
-                        <input type="text" name="new_title" placeholder="New title..." required class="input-sm">
-                        <button type="submit" class="btn-sm">Rename</button>
-                    </form>
-                </td>
             </tr>
             """
         if not file_rows:
-            file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>No uploads yet.</td></tr>"
+            file_rows = "<tr><td colspan='3' style='text-align:center; color:#94a3b8;'>No uploads yet.</td></tr>"
 
         html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Archive Manager & Direct Uploader</title>
+    <title>Archive Hub V2</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{ background: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; margin: 0; }}
@@ -156,10 +373,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         .header {{ background: #1e293b; padding: 18px 24px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; border-left: 6px solid #10b981; margin-bottom: 20px; }}
         .card {{ background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 20px; }}
         .btn {{ background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 8px; cursor: pointer; font-weight: bold; }}
-        .btn-sm {{ background: #059669; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }}
-        .input-sm {{ background: #1e293b; border: 1px solid #334155; color: white; padding: 6px 10px; border-radius: 6px; font-size: 0.8rem; }}
         .link-btn {{ color: #38bdf8; text-decoration: none; font-weight: 500; }}
-        .link-btn:hover {{ text-decoration: underline; }}
         table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
         th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #1f2937; font-size: 0.9rem; }}
         th {{ background: #1e293b; color: #94a3b8; font-weight: 600; }}
@@ -170,36 +384,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">🚀 Internet Archive Hub</h2>
+            <h2 style="margin:0;">🚀 Internet Archive Hub V2 (Resumable)</h2>
             <button class="btn" onclick="location.reload()">Refresh</button>
         </div>
-
         <div class="card">
-            <h3 style="margin-top:0;">📤 Web Direct Upload</h3>
-            <form method="POST" action="/upload" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <input type="file" name="file" required style="color:#94a3b8;">
-                <input type="text" name="custom_title" placeholder="Custom Title (Optional)" class="input-sm" style="flex:1;">
-                <button type="submit" class="btn">Upload to Archive</button>
-            </form>
-        </div>
-
-        <div class="card">
-            <h3 style="margin-top:0;">📁 Uploaded Files & Metadata</h3>
+            <h3 style="margin-top:0;">📁 Uploaded Files</h3>
             <table>
                 <thead>
-                    <tr>
-                        <th>Title / File</th>
-                        <th>Size</th>
-                        <th>Archive URL</th>
-                        <th>Rename</th>
-                    </tr>
+                    <tr><th>Title</th><th>Size</th><th>Archive URL</th></tr>
                 </thead>
-                <tbody>
-                    {file_rows}
-                </tbody>
+                <tbody>{file_rows}</tbody>
             </table>
         </div>
-
         <div class="card">
             <h3 style="margin-top:0;">📋 System Logs</h3>
             <div class="console">{log_rows}</div>
@@ -215,89 +411,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def do_POST(self):
-        if self.path == "/upload":
-            content_type = self.headers.get("Content-Type", "")
-            content_length = int(self.headers.get("Content-Length", 0))
-            
-            if "multipart/form-data" in content_type and content_length > 0:
-                body = self.rfile.read(content_length)
-                msg_headers = f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
-                msg = email.message_from_bytes(msg_headers + body)
-                
-                uploaded_file_data = None
-                custom_title = ""
-                file_name = None
-
-                for part in msg.walk():
-                    disp = part.get("Content-Disposition", "")
-                    if "name=\"file\"" in disp:
-                        uploaded_file_data = part.get_payload(decode=True)
-                        file_name = part.get_filename()
-                    elif "name=\"custom_title\"" in disp:
-                        custom_title = part.get_payload(decode=True).decode("utf-8", errors="ignore").strip()
-
-                if uploaded_file_data:
-                    item_id = f"web_{uuid.uuid4().hex[:8]}"
-                    file_ext = os.path.splitext(file_name)[1] if file_name else ".mp4"
-                    raw_path = f"/tmp/{item_id}{file_ext}"
-                    clean_title = custom_title if custom_title else (os.path.splitext(file_name)[0] if file_name else f"Web Upload {item_id}")
-
-                    with open(raw_path, "wb") as f:
-                        f.write(uploaded_file_data)
-
-                    file_size_fmt = format_size(len(uploaded_file_data))
-                    add_log(f"Web Direct Upload: {clean_title} ({file_size_fmt})")
-
-                    item = ia.get_item(item_id)
-                    item.upload(
-                        raw_path,
-                        metadata={
-                            "title": clean_title,
-                            "mediatype": "movies",
-                            "collection": "opensource_movies",
-                            "format": "h.264"
-                        },
-                        access_key=IA_ACCESS,
-                        secret_key=IA_SECRET
-                    )
-
-                    if os.path.exists(raw_path):
-                        os.remove(raw_path)
-
-                    archive_url = f"https://archive.org/details/{item_id}"
-                    uploaded_files_db.append({"id": item_id, "title": clean_title, "size": file_size_fmt, "url": archive_url})
-                    add_log(f"Web Upload Complete: {archive_url}")
-
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        if self.path == "/rename":
-            content_len = int(self.headers.get("Content-Length", 0))
-            post_body = self.rfile.read(content_len).decode("utf-8")
-            params = urllib.parse.parse_qs(post_body)
-
-            item_id = params.get("item_id", [""])[0]
-            new_title = params.get("new_title", [""])[0]
-
-            if item_id and new_title:
-                try:
-                    item = ia.get_item(item_id)
-                    item.modify_metadata({"title": new_title}, access_key=IA_ACCESS, secret_key=IA_SECRET)
-                    for f in uploaded_files_db:
-                        if f["id"] == item_id:
-                            f["title"] = new_title
-                    add_log(f"Renamed {item_id} -> '{new_title}'")
-                except Exception as e:
-                    add_log(f"Rename failed: {str(e)}")
-
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
     def log_message(self, format, *args):
         return
 
@@ -307,49 +420,47 @@ def run_web():
     server.serve_forever()
 
 # ==============================================================================
-# TELETHON CLIENT INITIALIZATION
+# TELEGRAM BOT CLIENT & EVENT HANDLERS
 # ==============================================================================
-bot = TelegramClient('tg_archive_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('tg_archive_session', API_ID, API_HASH)
 
-async def update_download_progress(current, total, status_msg, action_name, start_time, last_update):
-    now = time.time()
-    if now - last_update[0] < 3 and current != total:
-        return
-    last_update[0] = now
-
-    percentage = (current / total) * 100 if total > 0 else 0
-    filled = int(percentage / 10)
-    bar = "■" * filled + "□" * (10 - filled)
-    
-    elapsed = now - start_time
-    speed = current / elapsed if elapsed > 0 else 0
-    eta_seconds = (total - current) / speed if speed > 0 else 0
-    eta_formatted = format_eta(eta_seconds)
-    
-    text = (
-        f"📥 **{action_name}**\n\n"
-        f"`[{bar}]` **{percentage:.1f}%**\n\n"
-        f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-        f"📁 **Downloaded:** `{format_size(current)}` / `{format_size(total)}`\n"
-        f"⏳ **ETA:** `{eta_formatted}`"
-    )
-    try:
-        await status_msg.edit(text, parse_mode="markdown")
-    except Exception:
-        pass
-
-# ==============================================================================
-# TELEGRAM HANDLERS
-# ==============================================================================
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def start_handler(event):
-    add_log(f"Chat {event.chat_id} issued /start")
     await event.reply(
-        "⚡ **Telegram to Internet Archive Uploader Ready!**\n\n"
-        "Forward any video or `.mkv` file (up to 2GB) into this chat.\n"
-        "• Live download & upload progress bars with ETA\n"
-        "• Direct streamable playback on Archive.org"
+        "⚡ **Telegram to Internet Archive Hub V2 Ready!**\n\n"
+        "• Send or forward any video or file (up to 2GB).\n"
+        "• **Persistent Resume:** If the server or VS Code restarts, the download/upload automatically picks up where it left off.\n"
+        "• **Inline Controls:** Pause, Resume, or Cancel anytime using the interactive buttons."
     )
+
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    data = event.data.decode("utf-8")
+    action, task_id = data.split(":")
+
+    if task_id not in active_tasks:
+        await event.answer("Task is no longer active.", alert=True)
+        return
+
+    ctrl = active_tasks[task_id]
+
+    if action == "pause":
+        ctrl["pause"].clear()
+        await event.answer("Transfer paused.")
+        await event.edit(buttons=make_keyboard(task_id, is_paused=True))
+        add_log(f"Task {task_id} paused by user.")
+
+    elif action == "resume":
+        ctrl["pause"].set()
+        await event.answer("Transfer resumed.")
+        await event.edit(buttons=make_keyboard(task_id, is_paused=False))
+        add_log(f"Task {task_id} resumed by user.")
+
+    elif action == "cancel":
+        ctrl["cancel"] = True
+        ctrl["pause"].set()
+        await event.answer("Cancelling task...")
+        add_log(f"Task {task_id} cancelled by user.")
 
 @bot.on(events.NewMessage)
 async def media_handler(event):
@@ -360,92 +471,42 @@ async def media_handler(event):
         raw_name = None
         if hasattr(event.message.media, "document") and event.message.media.document:
             for attr in event.message.media.document.attributes:
-                if hasattr(attr, "file_name") and attr.file_name:
+                if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
                     raw_name = attr.file_name
                     break
         
         if not raw_name:
-            raw_name = f"video_{uuid.uuid4().hex[:6]}.mkv"
+            raw_name = f"video_{uuid.uuid4().hex[:6]}.mp4"
 
-        clean_base = os.path.splitext(raw_name)[0]
-        target_filename = f"{clean_base}.mp4"
         file_size = event.message.file.size if event.message.file else 0
 
         if file_size > 2000 * 1024 * 1024:
-            add_log(f"File {raw_name} ({format_size(file_size)}) exceeds Telegram bot limit of 2GB.")
-            await event.reply(
-                f"⚠️ **File is too large ({format_size(file_size)})!**\n\n"
-                f"Telegram server restrictions disconnect bot tokens at **2.00 GB**.\n"
-                f"Please upload a 720p or 1080p version under 2.00 GB."
-            )
+            await event.reply("⚠️ File exceeds Telegram's 2.00 GB bot limit.")
             return
 
-        add_log(f"Starting transfer: '{target_filename}' ({format_size(file_size)})")
-        status_msg = await event.reply("⏳ **Starting MTProto download from Telegram...**")
-        item_id = f"tg_{uuid.uuid4().hex[:8]}"
-        temp_file_path = f"/tmp/{item_id}_{target_filename}"
+        task_id = f"tg_{uuid.uuid4().hex[:8]}"
+        local_path = os.path.join(DOWNLOAD_DIR, f"{task_id}_{raw_name}")
 
-        try:
-            start_time = time.time()
-            last_update = [start_time]
+        status_msg = await event.reply(
+            "⏳ **Initializing transfer...**",
+            buttons=make_keyboard(task_id, is_paused=False)
+        )
 
-            # 1. Download file from Telegram with live ETA
-            await bot.download_media(
-                event.message.media,
-                file=temp_file_path,
-                progress_callback=lambda c, t: update_download_progress(
-                    c, t, status_msg, "Downloading from Telegram", start_time, last_update
-                )
-            )
+        db_execute(
+            '''INSERT INTO transfers (
+                task_id, chat_id, msg_id, status_msg_id, file_name, total_size,
+                downloaded_bytes, uploaded_bytes, stage, status, local_path, s3_upload_id, s3_parts_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (task_id, event.chat_id, event.message.id, status_msg.id, raw_name,
+             file_size, 0, 0, "downloading", "active", local_path, "", json.dumps([]))
+        )
 
-            add_log(f"Download complete. Uploading to Internet Archive with live progress...")
-            await status_msg.edit("🚀 **Starting upload to Internet Archive...**")
+        evt = asyncio.Event()
+        evt.set()
+        active_tasks[task_id] = {"pause": evt, "cancel": False}
 
-            # 2. Upload to Archive.org with live upload progress tracking
-            loop = asyncio.get_running_loop()
-            actual_size = os.path.getsize(temp_file_path)
-            item = ia.get_item(item_id)
-
-            def perform_upload():
-                with ProgressFileReader(temp_file_path, status_msg, loop, actual_size) as progress_file:
-                    item.upload(
-                        {target_filename: progress_file},
-                        metadata={
-                            "title": clean_base,
-                            "mediatype": "movies",
-                            "collection": "opensource_movies",
-                            "format": "h.264"
-                        },
-                        access_key=IA_ACCESS,
-                        secret_key=IA_SECRET
-                    )
-
-            await loop.run_in_executor(None, perform_upload)
-
-            archive_url = f"https://archive.org/details/{item_id}"
-            uploaded_files_db.append({
-                "id": item_id,
-                "title": clean_base,
-                "size": format_size(actual_size),
-                "url": archive_url
-            })
-
-            add_log(f"Upload complete: {archive_url}")
-            await status_msg.edit(
-                f"✅ **Upload Complete!**\n\n"
-                f"🎬 **File Name:** `{target_filename}`\n"
-                f"📦 **Size:** `{format_size(actual_size)}`\n"
-                f"▶️ **Play Online:** {archive_url}",
-                link_preview=True
-            )
-
-        except Exception as e:
-            add_log(f"Transfer error: {str(e)}")
-            await status_msg.edit(f"❌ **Error:** `{str(e)}`")
-        finally:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            gc.collect()
+        add_log(f"Queued task {task_id} for file '{raw_name}' ({format_size(file_size)})")
+        asyncio.create_task(execute_transfer(task_id, bot))
 
 # ==============================================================================
 # MAIN ENTRY POINT
@@ -454,5 +515,9 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Telegram Media Uploader online with 2-Stage ETA tracking.")
+    add_log("Telegram Media Uploader V2 online with persistent DB & Controls.")
+
+    loop = asyncio.get_event_loop()
+    bot.start(bot_token=BOT_TOKEN)
+    loop.create_task(resume_interrupted_tasks(bot))
     bot.run_until_disconnected()
