@@ -8,8 +8,7 @@ REQUIRED_PACKAGES = [
     "Telethon",
     "internetarchive",
     "requests",
-    "cryptg",
-    "boto3"
+    "cryptg"
 ]
 
 def ensure_dependencies():
@@ -38,7 +37,7 @@ import os
 import gc
 import uuid
 import time
-import json
+import re
 import sqlite3
 import asyncio
 import threading
@@ -46,6 +45,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import internetarchive as ia
 from telethon import TelegramClient, events, Button
+from telethon.errors import FloodWaitError
 from telethon.tl.types import DocumentAttributeFilename
 
 # ==============================================================================
@@ -59,11 +59,11 @@ IA_ACCESS = os.getenv("IA_ACCESS_KEY", "SjzCWtMdMVYsRBXl")
 IA_SECRET = os.getenv("IA_SECRET_KEY", "THTnm9iXNVafYy9b")
 
 DB_FILE = "tasks.db"
-DOWNLOAD_DIR = "/tmp/archive_hub"
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB chunks
-MAX_CONCURRENT_TRANSFERS = 1   # Prevents disk exhaustion and flood limits
+CHUNK_SIZE = 1024 * 1024  # 1 MB chunk
+MAX_CONCURRENT_TRANSFERS = 1
 
 queue_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
 active_tasks = {}
@@ -80,7 +80,7 @@ def add_log(msg):
         logs_history.pop(0)
 
 # ==============================================================================
-# DATABASE MANAGEMENT (WAL mode with 60s timeout for concurrent safety)
+# DATABASE MANAGEMENT
 # ==============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, timeout=60.0)
@@ -142,6 +142,13 @@ def format_eta(seconds):
         return f"{mins}m {secs}s"
     return f"{secs}s"
 
+def clean_archive_name(name):
+    base, ext = os.path.splitext(name)
+    clean_base = re.sub(r'[^a-zA-Z0-9]', '_', base)
+    clean_base = re.sub(r'_+', '_', clean_base).strip('_')
+    clean_ext = re.sub(r'[^a-zA-Z0-9.]', '', ext).lower()
+    return f"{clean_base}{clean_ext}"
+
 def make_keyboard(task_id, is_paused=False):
     if is_paused:
         return [
@@ -154,39 +161,89 @@ def make_keyboard(task_id, is_paused=False):
     ]
 
 # ==============================================================================
-# INTERNET ARCHIVE ITEM INITIALIZATION & S3 RESUME HELPERS
+# SAFE TELEGRAM MESSAGE UPDATER
 # ==============================================================================
-def ensure_ia_item_created(task_id, clean_title):
-    """Pre-initializes the bucket/item on Archive.org with metadata."""
-    headers = {
-        "authorization": f"LOW {IA_ACCESS}:{IA_SECRET}",
-        "x-archive-auto-make-bucket": "1",
-        "x-archive-meta-mediatype": "movies",
-        "x-archive-meta-collection": "opensource_movies",
-        "x-archive-meta-title": clean_title
-    }
-    url = f"https://s3.us.archive.org/{task_id}"
-    try:
-        r = requests.put(url, headers=headers, timeout=30)
-        return r.status_code in [200, 201, 409]
-    except Exception as e:
-        add_log(f"Metadata init check: {e}")
-        return True
+last_telegram_edit_time = {}
 
-def get_remote_uploaded_size(task_id, file_name):
-    """Checks the exact byte size Archive.org already has for this file."""
-    url = f"https://s3.us.archive.org/{task_id}/{file_name}"
-    headers = {"authorization": f"LOW {IA_ACCESS}:{IA_SECRET}"}
+async def safe_edit_message(bot_client, chat_id, message_id, text, buttons=None, force=False):
+    now = time.time()
+    last_time = last_telegram_edit_time.get(message_id, 0)
+    if not force and (now - last_time < 5.0):
+        return
+    last_telegram_edit_time[message_id] = now
+
     try:
-        r = requests.head(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            return int(r.headers.get("Content-Length", 0))
+        await bot_client.edit_message(chat_id, message_id, text, buttons=buttons)
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await bot_client.edit_message(chat_id, message_id, text, buttons=buttons)
+        except Exception:
+            pass
     except Exception:
         pass
-    return 0
 
 # ==============================================================================
-# WORKER: TRANSFER ENGINE (DOWNLOAD + RESUMABLE UPLOAD)
+# NETWORK STREAMING CLASS (Fixes 411 Length Required & Tracks Real Network Speed)
+# ==============================================================================
+class RealNetworkUploadStream:
+    def __init__(self, filepath, total_size, task_id, loop, progress_callback):
+        self._file = open(filepath, 'rb')
+        self.total_size = total_size
+        self.bytes_sent = 0
+        self.task_id = task_id
+        self.loop = loop
+        self.progress_callback = progress_callback
+        self.start_time = time.time()
+        self.last_update = self.start_time
+
+    def __len__(self):
+        return self.total_size
+
+    def read(self, size=-1):
+        if self.task_id in active_tasks:
+            ctrl = active_tasks[self.task_id]
+            if ctrl.get("cancel"):
+                raise Exception("TRANSFER_CANCELLED")
+            while not ctrl["pause"].is_set():
+                time.sleep(0.5)
+                if ctrl.get("cancel"):
+                    raise Exception("TRANSFER_CANCELLED")
+
+        chunk = self._file.read(size)
+        if chunk:
+            self.bytes_sent += len(chunk)
+            now = time.time()
+            if (now - self.last_update >= 5.0) or (self.bytes_sent >= self.total_size):
+                self.last_update = now
+                elapsed = now - self.start_time
+                speed = self.bytes_sent / elapsed if elapsed > 0 else 0
+                eta = (self.total_size - self.bytes_sent) / speed if speed > 0 else 0
+
+                db_execute("UPDATE transfers SET uploaded_bytes=? WHERE task_id=?", (self.bytes_sent, self.task_id))
+                asyncio.run_coroutine_threadsafe(
+                    self.progress_callback(self.bytes_sent, self.total_size, speed, eta),
+                    self.loop
+                )
+        return chunk
+
+    def seek(self, offset, whence=0):
+        return self._file.seek(offset, whence)
+
+    def tell(self):
+        return self._file.tell()
+
+    def close(self):
+        self._file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+# ==============================================================================
+# PIPELINE: TELEGRAM DOWNLOAD & RESUMABLE DIRECT S3 UPLOAD
 # ==============================================================================
 async def execute_transfer(task_id, bot_client):
     rows = db_execute("SELECT * FROM transfers WHERE task_id=?", (task_id,))
@@ -206,39 +263,61 @@ async def execute_transfer(task_id, bot_client):
     ctrl = active_tasks[task_id]
 
     async with queue_semaphore:
-        async def send_progress(curr, tot, speed, eta, step_name):
-            pct = (curr / tot * 100) if tot > 0 else 0
+        async def send_download_progress(curr, tot, speed, eta):
+            pct = min(100.0, (curr / tot * 100) if tot > 0 else 0)
             filled = int(pct / 10)
             bar = "■" * filled + "□" * (10 - filled)
             status_text = "⏸ Paused" if not ctrl["pause"].is_set() else f"⚡ `{format_size(speed)}/s`"
             text = (
-                f"🚀 **{step_name}**\n\n"
+                f"📥 **Downloading from Telegram**\n\n"
                 f"`[{bar}]` **{pct:.1f}%**\n\n"
                 f"**Status:** {status_text}\n"
-                f"📁 **Processed:** `{format_size(curr)}` / `{format_size(tot)}`\n"
+                f"📁 **Downloaded:** `{format_size(curr)}` / `{format_size(tot)}`\n"
                 f"⏳ **ETA:** `{format_eta(eta)}`"
             )
-            try:
-                await bot_client.edit_message(
-                    chat_id, status_msg_id, text,
-                    buttons=make_keyboard(task_id, is_paused=not ctrl["pause"].is_set())
-                )
-            except Exception:
-                pass
+            await safe_edit_message(
+                bot_client, chat_id, status_msg_id, text,
+                buttons=make_keyboard(task_id, is_paused=not ctrl["pause"].is_set())
+            )
+
+        async def send_upload_progress(curr, tot, speed, eta):
+            pct = min(100.0, (curr / tot * 100) if tot > 0 else 0)
+            filled = int(pct / 10)
+            bar = "■" * filled + "□" * (10 - filled)
+            status_text = "⏸ Paused" if not ctrl["pause"].is_set() else f"⚡ `{format_size(speed)}/s`"
+            text = (
+                f"🚀 **Uploading to Internet Archive**\n\n"
+                f"`[{bar}]` **{pct:.1f}%**\n\n"
+                f"**Status:** {status_text}\n"
+                f"📁 **Uploaded:** `{format_size(curr)}` / `{format_size(tot)}`\n"
+                f"⏳ **ETA:** `{format_eta(eta)}`"
+            )
+            await safe_edit_message(
+                bot_client, chat_id, status_msg_id, text,
+                buttons=make_keyboard(task_id, is_paused=not ctrl["pause"].is_set())
+            )
 
         try:
             # ------------------------------------------------------------------
-            # STAGE 1: TELEGRAM RESUMABLE DOWNLOAD (Byte offset on disk)
+            # STAGE 1: TELEGRAM RESUMABLE DOWNLOAD
             # ------------------------------------------------------------------
             if stage == "downloading":
                 original_msg = await bot_client.get_messages(chat_id, ids=msg_id)
                 if not original_msg or not original_msg.media:
-                    add_log(f"Task {task_id} original media is missing.")
+                    add_log(f"Task {task_id} media missing.")
                     return
 
-                current_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                current_size = 0
+                if os.path.exists(local_path):
+                    raw_disk = os.path.getsize(local_path)
+                    aligned_size = (raw_disk // CHUNK_SIZE) * CHUNK_SIZE
+                    if aligned_size != raw_disk:
+                        with open(local_path, "r+b") as f:
+                            f.truncate(aligned_size)
+                    current_size = aligned_size
+                    add_log(f"Resuming download {task_id} at {format_size(current_size)}")
+
                 start_time = time.time()
-                last_update = start_time
                 downloaded_session = 0
 
                 with open(local_path, "ab") as f:
@@ -254,21 +333,19 @@ async def execute_transfer(task_id, bot_client):
                         downloaded_session += len(chunk)
 
                         now = time.time()
-                        if (now - last_update >= 3) or (current_size >= total_size):
-                            elapsed = now - start_time
-                            speed = downloaded_session / elapsed if elapsed > 0 else 0
-                            eta = (total_size - current_size) / speed if speed > 0 else 0
-                            last_update = now
+                        elapsed = now - start_time
+                        speed = downloaded_session / elapsed if elapsed > 0 else 0
+                        eta = (total_size - current_size) / speed if speed > 0 else 0
 
-                            db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
-                            await send_progress(current_size, total_size, speed, eta, "Downloading from Telegram")
+                        db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
+                        await send_download_progress(current_size, total_size, speed, eta)
 
                 stage = "uploading"
                 db_execute("UPDATE transfers SET stage='uploading' WHERE task_id=?", (task_id,))
                 add_log(f"Download complete: {local_path}")
 
             # ------------------------------------------------------------------
-            # STAGE 2: INTERNET ARCHIVE RESUMABLE UPLOAD
+            # STAGE 2: DIRECT S3 STREAMING UPLOAD
             # ------------------------------------------------------------------
             if stage == "uploading":
                 if not os.path.exists(local_path):
@@ -279,138 +356,89 @@ async def execute_transfer(task_id, bot_client):
 
                 actual_size = os.path.getsize(local_path)
                 clean_title = os.path.splitext(file_name)[0]
+                safe_remote_name = clean_archive_name(file_name)
 
-                # 1. Initialize bucket item properly
-                ensure_ia_item_created(task_id, clean_title)
+                archive_item_id = f"tg_{uuid.uuid4().hex[:10]}"
+                add_log(f"Uploading '{safe_remote_name}' ({format_size(actual_size)}) to item {archive_item_id}...")
 
-                # 2. Check how much Archive.org already has to resume from 80% (or anywhere)
-                remote_size = get_remote_uploaded_size(task_id, file_name)
-                uploaded_bytes = remote_size if remote_size < actual_size else 0
+                await safe_edit_message(
+                    bot_client, chat_id, status_msg_id,
+                    "🚀 **Connecting & Initializing upload to Internet Archive...**",
+                    buttons=make_keyboard(task_id, is_paused=False),
+                    force=True
+                )
 
-                add_log(f"Uploading {task_id}: Resuming from byte {uploaded_bytes}/{actual_size} ({format_size(uploaded_bytes)})")
-
-                start_time = time.time()
-                last_update = start_time
-                session_uploaded = 0
-
-                upload_url = f"https://s3.us.archive.org/{task_id}/{file_name}"
+                upload_url = f"https://s3.us.archive.org/{archive_item_id}/{safe_remote_name}"
                 headers = {
                     "authorization": f"LOW {IA_ACCESS}:{IA_SECRET}",
+                    "x-archive-auto-make-bucket": "1",
                     "x-archive-meta-mediatype": "movies",
                     "x-archive-meta-collection": "opensource_movies",
-                    "x-archive-meta-title": clean_title
+                    "x-archive-meta-title": clean_title,
+                    "Content-Length": str(actual_size)
                 }
 
-                # Single chunk full upload if 0, or chunk streaming
-                with open(local_path, "rb") as f:
-                    if uploaded_bytes > 0:
-                        f.seek(uploaded_bytes)
+                loop = asyncio.get_running_loop()
 
-                    # Stream with progress and pause/cancel support
-                    class ProgressStream:
-                        def __init__(self, file_obj, total_len, start_offset):
-                            self.file_obj = file_obj
-                            self.total_len = total_len
-                            self.current = start_offset
-                            self.last_up = time.time()
-                            self.start_t = time.time()
-                            self.session_b = 0
+                def do_s3_upload():
+                    with RealNetworkUploadStream(local_path, actual_size, task_id, loop, send_upload_progress) as stream:
+                        session = requests.Session()
+                        response = session.put(
+                            upload_url,
+                            data=stream,
+                            headers=headers,
+                            timeout=(30, 3600)
+                        )
+                        if response.status_code not in [200, 201]:
+                            raise Exception(f"Archive.org returned status {response.status_code}: {response.text}")
 
-                        def read(self, size=-1):
-                            if ctrl.get("cancel"):
-                                raise Exception("TRANSFER_CANCELLED")
-                            while not ctrl["pause"].is_set():
-                                time.sleep(0.5)
-                                if ctrl.get("cancel"):
-                                    raise Exception("TRANSFER_CANCELLED")
+                await loop.run_in_executor(None, do_s3_upload)
 
-                            data = self.file_obj.read(size)
-                            if data:
-                                self.current += len(data)
-                                self.session_b += len(data)
-                                now = time.time()
-                                if (now - self.last_up >= 3) or (self.current >= self.total_len):
-                                    self.last_up = now
-                                    elapsed = now - self.start_t
-                                    speed = self.session_b / elapsed if elapsed > 0 else 0
-                                    eta = (self.total_len - self.current) / speed if speed > 0 else 0
-
-                                    db_execute("UPDATE transfers SET uploaded_bytes=? WHERE task_id=?", (self.current, task_id))
-                                    asyncio.run_coroutine_threadsafe(
-                                        send_progress(self.current, self.total_len, speed, eta, "Uploading to Internet Archive"),
-                                        bot_client.loop
-                                    )
-                            return data
-
-                    stream = ProgressStream(f, actual_size, uploaded_bytes)
-
-                    def do_put():
-                        # If resuming, supply the Content-Range header supported by S3
-                        put_headers = headers.copy()
-                        if uploaded_bytes > 0:
-                            put_headers["Content-Range"] = f"bytes {uploaded_bytes}-{actual_size - 1}/{actual_size}"
-
-                        resp = requests.put(upload_url, data=stream, headers=put_headers, timeout=120)
-                        if resp.status_code not in [200, 201]:
-                            # Fallback to standard full upload via IA library if ranged put is rejected
-                            item = ia.get_item(task_id)
-                            item.upload(
-                                {file_name: local_path},
-                                metadata={"title": clean_title, "mediatype": "movies", "collection": "opensource_movies"},
-                                access_key=IA_ACCESS,
-                                secret_key=IA_SECRET,
-                                verify=True,
-                                verbose=False
-                            )
-
-                    await bot_client.loop.run_in_executor(None, do_put)
-
-                archive_url = f"https://archive.org/details/{task_id}"
+                archive_url = f"https://archive.org/details/{archive_item_id}"
                 uploaded_files_db.append({
-                    "id": task_id,
+                    "id": archive_item_id,
                     "title": clean_title,
                     "size": format_size(actual_size),
                     "url": archive_url
                 })
-                add_log(f"Upload completed: {archive_url}")
+                add_log(f"Upload complete: {archive_url}")
 
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 db_execute("DELETE FROM transfers WHERE task_id=?", (task_id,))
 
-                await bot_client.edit_message(
-                    chat_id,
-                    status_msg_id,
+                await safe_edit_message(
+                    bot_client, chat_id, status_msg_id,
                     f"✅ **Upload Complete!**\n\n"
                     f"🎬 **File Name:** `{file_name}`\n"
                     f"📦 **Size:** `{format_size(actual_size)}`\n"
                     f"▶️ **Play Online:** {archive_url}",
                     buttons=None,
-                    link_preview=True
+                    force=True
                 )
 
         except Exception as e:
             if "TRANSFER_CANCELLED" in str(e) or ctrl.get("cancel"):
-                add_log(f"Task {task_id} successfully cancelled.")
+                add_log(f"Task {task_id} cancelled.")
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 db_execute("DELETE FROM transfers WHERE task_id=?", (task_id,))
-                await bot_client.edit_message(chat_id, status_msg_id, "❌ **Task Cancelled.**", buttons=None)
+                await safe_edit_message(bot_client, chat_id, status_msg_id, "❌ **Task Cancelled.**", buttons=None, force=True)
             else:
                 add_log(f"Transfer error on {task_id}: {str(e)}")
-                await bot_client.edit_message(chat_id, status_msg_id, f"❌ **Error:** `{str(e)}`", buttons=None)
+                await safe_edit_message(bot_client, chat_id, status_msg_id, f"❌ **Error:** `{str(e)}`", buttons=None, force=True)
         finally:
             gc.collect()
 
 # ==============================================================================
-# RESTART RECOVERY (Auto-Restores Queued & In-Progress Tasks in Order)
+# RESTART RECOVERY WORKER
 # ==============================================================================
 async def resume_interrupted_tasks(bot_client):
-    await asyncio.sleep(2)
+    await asyncio.sleep(4)
     rows = db_execute("SELECT task_id FROM transfers ORDER BY created_at ASC")
     for r in rows:
         t_id = r[0]
-        add_log(f"Resuming queued/interrupted task: {t_id}")
+        add_log(f"Restoring saved task: {t_id}")
         asyncio.create_task(execute_transfer(t_id, bot_client))
 
 # ==============================================================================
@@ -458,7 +486,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">🚀 Internet Archive Hub V3 (Multi-Queue & Resumable)</h2>
+            <h2 style="margin:0;">🚀 Internet Archive Hub V3</h2>
             <button class="btn" onclick="location.reload()">Refresh</button>
         </div>
         <div class="card">
@@ -499,10 +527,10 @@ bot = TelegramClient('tg_archive_session', API_ID, API_HASH)
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def start_handler(event):
     await event.reply(
-        "⚡ **Telegram to Internet Archive Hub V3 Ready!**\n\n"
-        "• **Multi-File Queue:** Send multiple files at once; they will be queued and processed safely without crashing.\n"
-        "• **Persistent Resume:** If the bot restarts at 80%, it resumes directly from 80% without starting from zero.\n"
-        "• **Inline Controls:** Pause, Resume, or Cancel anytime with the buttons below."
+        "⚡ **Telegram to Internet Archive Hub Ready!**\n\n"
+        "• Send or forward any video (up to 2GB).\n"
+        "• Real-time accurate upload progress bar.\n"
+        "• Pause, Resume, or Cancel anytime with the buttons below."
     )
 
 @bot.on(events.CallbackQuery)
@@ -519,13 +547,13 @@ async def callback_handler(event):
     if action == "pause":
         ctrl["pause"].clear()
         await event.answer("Transfer paused.")
-        await event.edit(buttons=make_keyboard(task_id, is_paused=True))
+        await safe_edit_message(bot, event.chat_id, event.message_id, buttons=make_keyboard(task_id, is_paused=True), force=True)
         add_log(f"Task {task_id} paused by user.")
 
     elif action == "resume":
         ctrl["pause"].set()
         await event.answer("Transfer resumed.")
-        await event.edit(buttons=make_keyboard(task_id, is_paused=False))
+        await safe_edit_message(bot, event.chat_id, event.message_id, buttons=make_keyboard(task_id, is_paused=False), force=True)
         add_log(f"Task {task_id} resumed by user.")
 
     elif action == "cancel":
@@ -592,5 +620,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Telegram Media Uploader V3 online (Multi-file Safe + Resumable).")
+    add_log("Telegram Media Uploader online (Fixed 411 & True S3 Streaming).")
     asyncio.run(main())
