@@ -38,11 +38,13 @@ import gc
 import uuid
 import time
 import email
+import re
 import urllib.parse
 import sqlite3
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
 import internetarchive as ia
 from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError
@@ -62,7 +64,7 @@ DB_FILE = "tasks.db"
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB chunk for Telegram MTProto offset resume
+CHUNK_SIZE = 256 * 1024  # 256 KB smooth buffer
 MAX_CONCURRENT_TRANSFERS = 1
 
 queue_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
@@ -80,7 +82,7 @@ def add_log(msg):
         logs_history.pop(0)
 
 # ==============================================================================
-# DATABASE MANAGEMENT (Preserves Tasks Across Bot Restarts)
+# DATABASE MANAGEMENT (WAL mode for restart persistence)
 # ==============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, timeout=60.0)
@@ -96,6 +98,8 @@ def init_db():
             chat_id INTEGER,
             msg_id INTEGER,
             status_msg_id INTEGER,
+            source_type TEXT,
+            url_source TEXT,
             file_name TEXT,
             target_filename TEXT,
             clean_base TEXT,
@@ -150,14 +154,14 @@ def make_keyboard(task_id):
     ]
 
 # ==============================================================================
-# SAFE TELEGRAM MESSAGE UPDATER (FloodWait Protection)
+# SAFE TELEGRAM EDIT (Prevents FloodWait 429)
 # ==============================================================================
 last_telegram_edit_time = {}
 
 async def safe_edit_message(bot_client, chat_id, message_id, text, buttons=None, force=False):
     now = time.time()
     last_time = last_telegram_edit_time.get(message_id, 0)
-    if not force and (now - last_time < 4.5):
+    if not force and (now - last_time < 4.0):
         return
     last_telegram_edit_time[message_id] = now
 
@@ -173,10 +177,9 @@ async def safe_edit_message(bot_client, chat_id, message_id, text, buttons=None,
         pass
 
 # ==============================================================================
-# PROGRESS FILE WRAPPER (From Your Sample Script)
+# PROGRESS FILE WRAPPER FOR ARCHIVE.ORG
 # ==============================================================================
 class ProgressFileReader(object):
-    """File-like wrapper that tracks bytes read by InternetArchive S3 and updates Telegram UI."""
     def __init__(self, filepath, total_size, task_id, chat_id, status_msg_id, bot_client, loop):
         self._file = open(filepath, 'rb')
         self.total_size = total_size
@@ -199,7 +202,7 @@ class ProgressFileReader(object):
         if data:
             self.bytes_read += len(data)
             now = time.time()
-            if (now - self.last_update >= 4.5) or (self.bytes_read >= self.total_size):
+            if (now - self.last_update >= 4.0) or (self.bytes_read >= self.total_size):
                 self.last_update = now
                 pct = min(100.0, (self.bytes_read / self.total_size) * 100 if self.total_size > 0 else 0)
                 filled = int(pct / 10)
@@ -241,7 +244,7 @@ class ProgressFileReader(object):
         self.close()
 
 # ==============================================================================
-# PIPELINE: TELEGRAM DOWNLOAD & ARCHIVE.ORG UPLOAD
+# PIPELINE: TELEGRAM / DIRECT LINK DOWNLOAD & ARCHIVE.ORG UPLOAD
 # ==============================================================================
 async def execute_transfer(task_id, bot_client):
     rows = db_execute("SELECT * FROM transfers WHERE task_id=?", (task_id,))
@@ -250,77 +253,148 @@ async def execute_transfer(task_id, bot_client):
 
     r = rows[0]
     chat_id, msg_id, status_msg_id = r[1], r[2], r[3]
-    file_name, target_filename, clean_base = r[4], r[5], r[6]
-    total_size, stage, local_path = r[7], r[10], r[12]
+    source_type, url_source = r[4], r[5]
+    file_name, target_filename, clean_base = r[6], r[7], r[8]
+    total_size, stage, local_path = r[9], r[12], r[14]
 
     if task_id not in active_tasks:
         active_tasks[task_id] = {"cancel": False}
 
     ctrl = active_tasks[task_id]
+    main_loop = asyncio.get_running_loop()
 
     async with queue_semaphore:
-        async def send_download_progress(curr, tot, speed, eta):
+        async def send_download_progress(curr, tot, speed, eta, source_label, force=False):
             pct = min(100.0, (curr / tot * 100) if tot > 0 else 0)
             filled = int(pct / 10)
             bar = "■" * filled + "□" * (10 - filled)
+            tot_str = format_size(tot) if tot > 0 else "Calculating..."
             text = (
-                f"📥 **Downloading from Telegram**\n\n"
+                f"📥 **Downloading from {source_label}**\n\n"
                 f"`[{bar}]` **{pct:.1f}%**\n\n"
                 f"⚡ **Speed:** `{format_size(speed)}/s`\n"
-                f"📁 **Downloaded:** `{format_size(curr)}` / `{format_size(tot)}`\n"
+                f"📁 **Downloaded:** `{format_size(curr)}` / `{tot_str}`\n"
                 f"⏳ **ETA:** `{format_eta(eta)}`"
             )
             await safe_edit_message(
                 bot_client, chat_id, status_msg_id, text,
-                buttons=make_keyboard(task_id)
+                buttons=make_keyboard(task_id), force=force
             )
 
         try:
             # ------------------------------------------------------------------
-            # STAGE 1: TELEGRAM RESUMABLE DOWNLOAD
+            # STAGE 1: DOWNLOAD STAGE
             # ------------------------------------------------------------------
             if stage == "downloading":
-                original_msg = await bot_client.get_messages(chat_id, ids=msg_id)
-                if not original_msg or not original_msg.media:
-                    add_log(f"Task {task_id} media missing.")
-                    return
-
                 current_size = 0
                 if os.path.exists(local_path):
-                    raw_disk = os.path.getsize(local_path)
-                    aligned_size = (raw_disk // CHUNK_SIZE) * CHUNK_SIZE
-                    if aligned_size != raw_disk:
-                        with open(local_path, "r+b") as f:
-                            f.truncate(aligned_size)
-                    current_size = aligned_size
+                    current_size = os.path.getsize(local_path)
                     add_log(f"Resuming download {task_id} at {format_size(current_size)}")
 
                 start_time = time.time()
                 downloaded_session = 0
 
-                with open(local_path, "ab") as f:
-                    async for chunk in bot_client.iter_download(original_msg.media, offset=current_size, chunk_size=CHUNK_SIZE):
-                        if ctrl["cancel"]:
-                            raise Exception("TRANSFER_CANCELLED")
+                # OPTION A: TELEGRAM DOWNLOAD
+                if source_type == "telegram":
+                    original_msg = await bot_client.get_messages(chat_id, ids=msg_id)
+                    if not original_msg or not original_msg.media:
+                        add_log(f"Task {task_id} media missing.")
+                        return
 
-                        f.write(chunk)
-                        current_size += len(chunk)
-                        downloaded_session += len(chunk)
+                    with open(local_path, "ab") as f:
+                        async for chunk in bot_client.iter_download(original_msg.media, offset=current_size, chunk_size=CHUNK_SIZE):
+                            if ctrl["cancel"]:
+                                raise Exception("TRANSFER_CANCELLED")
 
-                        now = time.time()
-                        elapsed = now - start_time
-                        speed = downloaded_session / elapsed if elapsed > 0 else 0
-                        eta = (total_size - current_size) / speed if speed > 0 else 0
+                            f.write(chunk)
+                            current_size += len(chunk)
+                            downloaded_session += len(chunk)
 
-                        db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
-                        await send_download_progress(current_size, total_size, speed, eta)
+                            now = time.time()
+                            elapsed = now - start_time
+                            speed = downloaded_session / elapsed if elapsed > 0 else 0
+                            eta = (total_size - current_size) / speed if speed > 0 else 0
+
+                            db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
+                            await send_download_progress(current_size, total_size, speed, eta, "Telegram")
+
+                # OPTION B: DIRECT LINK DOWNLOAD (Zero-Stall Stream Engine)
+                elif source_type == "direct_url":
+                    add_log(f"Starting direct stream download for {task_id}: {url_source}")
+                    
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                        "Accept": "*/*",
+                        "Accept-Encoding": "identity",
+                        "Connection": "keep-alive"
+                    }
+                    if current_size > 0:
+                        headers["Range"] = f"bytes={current_size}-"
+
+                    def do_direct_download():
+                        nonlocal current_size, downloaded_session, total_size, file_name, target_filename, clean_base
+                        session = requests.Session()
+                        
+                        # Follow redirects explicitly first to obtain active direct stream endpoint
+                        resp = session.get(url_source, headers=headers, stream=True, allow_redirects=True, timeout=30)
+                        resp.raise_for_status()
+
+                        # Determine size from headers
+                        content_len = resp.headers.get("Content-Length")
+                        if content_len:
+                            total_size = int(content_len) + (current_size if "bytes=" in headers.get("Range", "") else 0)
+                            db_execute("UPDATE transfers SET total_size=? WHERE task_id=?", (total_size, task_id))
+
+                        # Extract filename if present
+                        cd = resp.headers.get("Content-Disposition", "")
+                        if "filename=" in cd:
+                            match = re.findall(r'filename="?([^";]+)"?', cd)
+                            if match:
+                                file_name = match[0].strip()
+                                clean_base = os.path.splitext(file_name)[0]
+                                target_filename = f"{clean_base}.mp4"
+                                db_execute(
+                                    "UPDATE transfers SET file_name=?, target_filename=?, clean_base=? WHERE task_id=?",
+                                    (file_name, target_filename, clean_base, task_id)
+                                )
+
+                        add_log(f"Connected! Writing stream chunks to {local_path}...")
+                        last_ui_update = time.time()
+
+                        mode = "ab" if current_size > 0 else "wb"
+                        with open(local_path, mode) as f:
+                            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                                if ctrl.get("cancel"):
+                                    resp.close()
+                                    raise Exception("TRANSFER_CANCELLED")
+                                if not chunk:
+                                    continue
+
+                                f.write(chunk)
+                                current_size += len(chunk)
+                                downloaded_session += len(chunk)
+
+                                now = time.time()
+                                if (now - last_ui_update >= 3.5) or (total_size > 0 and current_size >= total_size):
+                                    last_ui_update = now
+                                    elapsed = now - start_time
+                                    speed = downloaded_session / elapsed if elapsed > 0 else 0
+                                    eta = (total_size - current_size) / speed if (speed > 0 and total_size > current_size) else 0
+
+                                    db_execute("UPDATE transfers SET downloaded_bytes=? WHERE task_id=?", (current_size, task_id))
+                                    asyncio.run_coroutine_threadsafe(
+                                        send_download_progress(current_size, total_size, speed, eta, "Direct Link"),
+                                        main_loop
+                                    )
+
+                    await main_loop.run_in_executor(None, do_direct_download)
 
                 stage = "uploading"
                 db_execute("UPDATE transfers SET stage='uploading' WHERE task_id=?", (task_id,))
                 add_log(f"Download complete: {local_path}")
 
             # ------------------------------------------------------------------
-            # STAGE 2: EXACT ORIGINAL UPLOAD LOGIC (.mp4 & format: h.264)
+            # STAGE 2: ARCHIVE.ORG UPLOAD (.mp4 & format: h.264)
             # ------------------------------------------------------------------
             if stage == "uploading":
                 if not os.path.exists(local_path):
@@ -340,11 +414,10 @@ async def execute_transfer(task_id, bot_client):
                     force=True
                 )
 
-                loop = asyncio.get_running_loop()
                 item = ia.get_item(item_id)
 
                 def perform_upload():
-                    with ProgressFileReader(local_path, actual_size, task_id, chat_id, status_msg_id, bot_client, loop) as progress_file:
+                    with ProgressFileReader(local_path, actual_size, task_id, chat_id, status_msg_id, bot_client, main_loop) as progress_file:
                         item.upload(
                             {target_filename: progress_file},
                             metadata={
@@ -357,7 +430,7 @@ async def execute_transfer(task_id, bot_client):
                             secret_key=IA_SECRET
                         )
 
-                await loop.run_in_executor(None, perform_upload)
+                await main_loop.run_in_executor(None, perform_upload)
 
                 archive_url = f"https://archive.org/details/{item_id}"
                 uploaded_files_db.append({
@@ -467,15 +540,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         </div>
 
         <div class="card">
-            <h3 style="margin-top:0;">📤 Web Direct Upload</h3>
-            <form method="POST" action="/upload" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <input type="file" name="file" required style="color:#94a3b8;">
-                <input type="text" name="custom_title" placeholder="Custom Title (Optional)" class="input-sm" style="flex:1;">
-                <button type="submit" class="btn">Upload to Archive</button>
-            </form>
-        </div>
-
-        <div class="card">
             <h3 style="margin-top:0;">📁 Uploaded Files & Metadata</h3>
             <table>
                 <thead>
@@ -548,10 +612,10 @@ bot = TelegramClient('tg_archive_session', API_ID, API_HASH)
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def start_handler(event):
     await event.reply(
-        "⚡ **Telegram to Internet Archive Uploader Ready!**\n\n"
-        "• Send or forward any video or `.mkv` file (up to 2GB).\n"
-        "• Auto-resumes downloads across bot restarts.\n"
-        "• Direct MP4 web streaming on Archive.org."
+        "⚡ **Telegram & Direct Link Uploader Ready!**\n\n"
+        "• Send any video or `.mkv` file.\n"
+        "• **Direct Link Support:** Send any direct download link (including shortened URLs like `clck.ru`).\n"
+        "• Automatically downloads and uploads to Archive.org as streamable `.mp4`."
     )
 
 @bot.on(events.CallbackQuery)
@@ -571,10 +635,43 @@ async def callback_handler(event):
         add_log(f"Task {task_id} cancelled by user.")
 
 @bot.on(events.NewMessage)
-async def media_handler(event):
-    if event.message.message and event.message.message.startswith("/"):
+async def media_or_link_handler(event):
+    msg_text = (event.message.message or "").strip()
+    if msg_text.startswith("/"):
         return
 
+    # 1. HANDLE DIRECT HTTP / HTTPS DOWNLOAD LINKS
+    url_match = re.search(r"(https?://[^\s]+)", msg_text)
+    if url_match:
+        url = url_match.group(1)
+        task_id = f"url_{uuid.uuid4().hex[:8]}"
+
+        status_msg = await event.reply(
+            "⏳ **Connecting to Direct Download Link...**",
+            buttons=make_keyboard(task_id)
+        )
+
+        initial_name = f"video_{uuid.uuid4().hex[:6]}.mkv"
+        target_filename = f"{os.path.splitext(initial_name)[0]}.mp4"
+        local_path = os.path.join(DOWNLOAD_DIR, f"{task_id}_{initial_name}")
+
+        db_execute(
+            '''INSERT INTO transfers (
+                task_id, chat_id, msg_id, status_msg_id, source_type, url_source,
+                file_name, target_filename, clean_base, total_size, downloaded_bytes,
+                uploaded_bytes, stage, status, local_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (task_id, event.chat_id, event.message.id, status_msg.id, "direct_url", url,
+             initial_name, target_filename, os.path.splitext(initial_name)[0], 0, 0, 0,
+             "downloading", "active", local_path, time.time())
+        )
+
+        active_tasks[task_id] = {"cancel": False}
+        add_log(f"Queued direct link: '{url}'")
+        asyncio.create_task(execute_transfer(task_id, bot))
+        return
+
+    # 2. HANDLE TELEGRAM MEDIA FILES
     if event.message.media:
         raw_name = None
         if hasattr(event.message.media, "document") and event.message.media.document:
@@ -604,17 +701,16 @@ async def media_handler(event):
 
         db_execute(
             '''INSERT INTO transfers (
-                task_id, chat_id, msg_id, status_msg_id, file_name, target_filename,
-                clean_base, total_size, downloaded_bytes, uploaded_bytes, stage, status,
-                local_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (task_id, event.chat_id, event.message.id, status_msg.id, raw_name,
-             target_filename, clean_base, file_size, 0, 0, "downloading", "active",
-             local_path, time.time())
+                task_id, chat_id, msg_id, status_msg_id, source_type, url_source,
+                file_name, target_filename, clean_base, total_size, downloaded_bytes,
+                uploaded_bytes, stage, status, local_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (task_id, event.chat_id, event.message.id, status_msg.id, "telegram", "",
+             raw_name, target_filename, clean_base, file_size, 0, 0, "downloading",
+             "active", local_path, time.time())
         )
 
         active_tasks[task_id] = {"cancel": False}
-
         add_log(f"Queued file: '{raw_name}' ({format_size(file_size)})")
         asyncio.create_task(execute_transfer(task_id, bot))
 
@@ -630,5 +726,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    add_log("Telegram Media Uploader online (No FFmpeg, Auto-Resume & Cancel Only).")
+    add_log("Telegram & Direct Link Media Uploader online (Smooth Stream Engine).")
     asyncio.run(main())
